@@ -7,6 +7,7 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
+// Render 배포 환경 호환 (기본값 8080)
 const PORT = process.env.PORT || 8080;
 
 app.use(cors());
@@ -93,7 +94,7 @@ async function calculateRoute(originId, destId) {
   }
 }
 
-// --- [API 1] 여행 일정 생성 (사용량 제한 포함) ---
+// --- [API 1] 여행 일정 생성 (사용량 제한 적용) ---
 app.post('/api/generate-trip', async (req, res) => {
   try {
     const { destination, startDate, endDate, style, companions, user_id } = req.body;
