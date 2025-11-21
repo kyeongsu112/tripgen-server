@@ -15,7 +15,8 @@ app.use(express.json());
 // --- [설정] 환경 변수 및 클라이언트 ---
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+// 모델은 최신 상황에 맞춰서 변경 가능 (예: gemini-pro 또는 gemini-1.5-flash 등)
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" }); 
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 
 // --- [설정] 등급별 월간 이용 한도 ---
@@ -94,10 +95,11 @@ async function calculateRoute(originId, destId) {
   }
 }
 
-// --- [API 1] 여행 일정 생성 (사용량 제한 적용) ---
+// --- [API 1] 여행 일정 생성 (사용량 제한 + 시간 제약 추가) ---
 app.post('/api/generate-trip', async (req, res) => {
   try {
-    const { destination, startDate, endDate, style, companions, user_id } = req.body;
+    // ✨ arrivalTime, departureTime 추가
+    const { destination, startDate, endDate, style, companions, arrivalTime, departureTime, user_id } = req.body;
 
     if (!user_id) return res.status(401).json({ error: "로그인이 필요합니다." });
 
@@ -133,26 +135,53 @@ app.post('/api/generate-trip', async (req, res) => {
       });
     }
 
-    // 2. AI 생성
+    // 2. AI 생성 프롬프트 (✨ 시간 제약 및 예약 링크 반영)
     const totalDays = calculateDays(startDate, endDate);
     const prompt = `
       여행지: ${destination}
       기간: ${startDate} 부터 ${endDate} 까지 (총 ${totalDays}일)
       스타일: ${style}
       동행: ${companions}
-      위 조건으로 여행 일정을 계획하세요.
-      [요청사항] 
-      1. '숙소', '이동' 제외하고 **실제 방문할 장소** 위주 구성.
-      2. 장소 이름은 구글 지도 검색용 명칭 사용.
-      3. JSON 포맷만 출력.
-      JSON 구조: { "trip_title": "제목", "itinerary": [ { "day": 1, "date": "${startDate}", "activities": [ { "time": "10:00", "place_name": "장소명", "type": "관광/식사", "activity_description": "설명" } ] } ] }
+      
+      **[시간 제약 조건 - 필수]**
+      1. 첫째 날(${startDate}): 비행기 도착 시간이 **${arrivalTime || "정보 없음"}** 입니다. 이 시간 이후부터 일정을 시작하세요.
+      2. 마지막 날(${endDate}): 비행기 출발 시간이 **${departureTime || "정보 없음"}** 입니다. 공항 이동 시간을 고려하여 이 시간 3시간 전에는 일정을 종료하세요.
+      
+      **[요청사항]**
+      1. '숙소', '이동'만 있는 활동은 제외하고 **실제 방문할 장소** 위주로 구성하세요.
+      2. 장소 이름은 구글 지도 검색용 공식 명칭을 사용하세요.
+      3. **booking_url 필드 추가:**
+         - 입장권이나 예약이 필요한 장소(박물관, 테마파크, 고급 식당 등)는 공식 홈페이지나 예매 링크를 찾아서 넣어주세요.
+         - 링크를 찾기 어렵다면 구글 검색 URL 포맷("https://www.google.com/search?q=${destination}+장소명+예약")을 넣어주세요.
+         - 공원이나 거리처럼 예약이 필요 없는 곳은 null로 설정하세요.
+
+      **[출력 형식 - JSON Only]**
+      반드시 아래 JSON 포맷으로만 출력하세요. 마크다운 기호(json)나 설명은 쓰지 마세요.
+      { 
+        "trip_title": "제목", 
+        "itinerary": [ 
+          { 
+            "day": 1, 
+            "date": "YYYY-MM-DD", 
+            "activities": [ 
+              { 
+                "time": "HH:MM", 
+                "place_name": "장소명", 
+                "type": "관광/식사/카페", 
+                "activity_description": "활동 설명",
+                "booking_url": "URL 또는 null"
+              } 
+            ] 
+          } 
+        ] 
+      }
     `;
 
     const result = await model.generateContent(prompt);
     const text = result.response.text().replace(/```json|```/g, "").trim();
     const itineraryJson = JSON.parse(text);
 
-    // 3. 데이터 보정
+    // 3. 데이터 보정 (API 호출)
     for (const dayPlan of itineraryJson.itinerary) {
       const enrichedActivities = [];
       for (const activity of dayPlan.activities) {
@@ -164,6 +193,7 @@ app.post('/api/generate-trip', async (req, res) => {
         enrichedActivities.push({ ...activity, ...details });
       }
 
+      // 경로 계산 (이동 시간)
       for (let i = 1; i < enrichedActivities.length; i++) {
         const prev = enrichedActivities[i - 1];
         const curr = enrichedActivities[i];
@@ -219,10 +249,10 @@ app.get('/api/my-trips', async (req, res) => {
   res.status(200).json({ success: true, data });
 });
 
-// --- [API 3] 여행 일정 삭제 (횟수 복구 X) ---
+// --- [API 3] 여행 일정 삭제 ---
 app.delete('/api/trip/:id', async (req, res) => {
   const { id } = req.params;
-  const { user_id } = req.body;
+  const { user_id } = req.body; // DELETE 요청도 body에 user_id 필요 (또는 헤더)
   if (!user_id) return res.status(401).json({ error: "권한이 없습니다." });
 
   const { error } = await supabase
@@ -233,7 +263,6 @@ app.delete('/api/trip/:id', async (req, res) => {
 
   if (error) return res.status(500).json({ error: error.message });
   
-  // 삭제만 하고 횟수 복구는 하지 않음
   res.status(200).json({ success: true, message: "삭제되었습니다." });
 });
 
@@ -266,7 +295,6 @@ app.put('/api/admin/user/tier', async (req, res) => {
 // --- [API 6] 공유용: 공개 조회 ---
 app.get('/api/public/trip/:id', async (req, res) => {
   const { id } = req.params;
-  // 로그인 여부 상관없이 ID로만 조회
   const { data, error } = await supabase
     .from('trip_plans')
     .select('*')
