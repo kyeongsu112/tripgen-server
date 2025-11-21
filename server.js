@@ -15,7 +15,8 @@ app.use(express.json());
 // --- [설정] 환경 변수 및 클라이언트 ---
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-// 모델은 최신 상황에 맞춰서 변경 가능 (예: gemini-pro 또는 gemini-1.5-flash 등)
+
+// 모델 설정 (최신 모델 사용)
 const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); 
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 
@@ -34,8 +35,13 @@ function calculateDays(start, end) {
   return Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
 }
 
-// --- [Helper] 장소 상세 정보 조회 (Places API) ---
+// --- [Helper] 장소 상세 정보 조회 (Places API 강화됨) ---
 async function fetchPlaceDetails(placeName) {
+  // "숙소 체크인" 등은 API 검색 제외
+  if (placeName.includes("체크인") || placeName.includes("숙소") || placeName.includes("복귀")) {
+     return { place_name: placeName, type: "숙소" };
+  }
+
   try {
     const response = await axios.post(
       `https://places.googleapis.com/v1/places:searchText`,
@@ -44,7 +50,8 @@ async function fetchPlaceDetails(placeName) {
         headers: {
           "Content-Type": "application/json",
           "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
-          "X-Goog-FieldMask": "places.id,places.photos,places.rating,places.userRatingCount,places.googleMapsUri,places.location" 
+          // ✨ [핵심 변경] places.types를 추가로 가져와서 장소 유형을 파악함
+          "X-Goog-FieldMask": "places.id,places.photos,places.rating,places.userRatingCount,places.googleMapsUri,places.location,places.websiteUri,places.types" 
         }
       }
     );
@@ -60,12 +67,14 @@ async function fetchPlaceDetails(placeName) {
 
     return {
       place_id: place.id,
-      place_name: placeName, 
+      place_name: placeName, // 구글이 인식한 정식 명칭
       rating: place.rating || "정보 없음",
       ratingCount: place.userRatingCount || 0,
       googleMapsUri: place.googleMapsUri || "#",
+      websiteUri: place.websiteUri || null,
       location: place.location,
-      photoUrl: photoUrl
+      photoUrl: photoUrl,
+      types: place.types || [] // 장소 유형 (park, restaurant 등)
     };
   } catch (error) {
     console.error(`⚠️ [${placeName}] 검색 실패:`, error.message);
@@ -95,10 +104,9 @@ async function calculateRoute(originId, destId) {
   }
 }
 
-// --- [API 1] 여행 일정 생성 (사용량 제한 + 시간 제약 추가) ---
+// --- [API 1] 여행 일정 생성 (프롬프트 및 로직 대폭 수정) ---
 app.post('/api/generate-trip', async (req, res) => {
   try {
-    // ✨ arrivalTime, departureTime 추가
     const { destination, startDate, endDate, style, companions, arrivalTime, departureTime, user_id } = req.body;
 
     if (!user_id) return res.status(401).json({ error: "로그인이 필요합니다." });
@@ -127,38 +135,41 @@ app.post('/api/generate-trip', async (req, res) => {
       await supabase.from('user_limits').update({ usage_count: 0, last_reset_date: new Date() }).eq('user_id', user_id);
     }
 
-    // 한도 초과 차단 (관리자는 예외)
     const limit = TIER_LIMITS[userLimit.tier] || 3;
     if (userLimit.tier !== 'admin' && userLimit.usage_count >= limit) {
-      return res.status(403).json({ 
-        error: `이번 달 생성 한도(${limit}회)를 모두 사용하셨습니다.` 
-      });
+      return res.status(403).json({ error: `이번 달 생성 한도(${limit}회)를 모두 사용하셨습니다.` });
     }
 
-    // 2. AI 생성 프롬프트 (✨ 시간 제약 및 예약 링크 반영)
+    // totalDays 계산 (프롬프트보다 먼저)
     const totalDays = calculateDays(startDate, endDate);
+
+    // 2. 프롬프트 생성 (구체적 상호명 요구 & 예약 링크 로직 강화)
     const prompt = `
       여행지: ${destination}
       기간: ${startDate} 부터 ${endDate} 까지 (총 ${totalDays}일)
       스타일: ${style}
       동행: ${companions}
       
-      **[시간 제약 조건 - 필수]**
-      1. 첫째 날(${startDate}): 비행기 도착 시간이 **${arrivalTime || "정보 없음"}** 입니다. 이 시간 이후부터 일정을 시작하세요.
-      2. 마지막 날(${endDate}): 비행기 출발 시간이 **${departureTime || "정보 없음"}** 입니다. 공항 이동 시간을 고려하여 이 시간 3시간 전에는 일정을 종료하세요.
-      
-      **[요청사항]**
-      1. '숙소', '이동'만 있는 활동은 제외하고 **실제 방문할 장소** 위주로 구성하세요.
-      2. 장소 이름은 구글 지도 검색용 공식 명칭을 사용하세요.
-      3. **booking_url 필드 추가:**
-         - 입장권이나 예약이 필요한 장소(박물관, 테마파크, 고급 식당 등)는 공식 홈페이지나 예매 링크를 찾아서 넣어주세요.
-         - 링크를 찾기 어렵다면 구글 검색 URL 포맷("https://www.google.com/search?q=${destination}+장소명+예약")을 넣어주세요.
-         - 공원이나 거리처럼 예약이 필요 없는 곳은 null로 설정하세요.
+      **[필수 시간 제약]**
+      1. Day 1: 도착 시간 **${arrivalTime || "오전 10:00"}** 이후부터 일정을 시작하세요.
+      2. Day ${totalDays}: 출발 시간 **${departureTime || "오후 6:00"}** 3시간 전에는 공항으로 출발하도록 일정을 종료하세요.
+
+      **[일정 구성 요구사항 - 매우 중요]**
+      1. **구체적인 상호명 필수:** - "성수동 맛집", "근처 카페", "점심 식사" 같은 추상적인 표현을 **절대 금지**합니다.
+         - 반드시 **직전 관광지 근처의 실존하는 구체적인 식당 이름**(예: 소문난성수감자탕, 난포)을 지정하세요.
+      2. **숙소:** Day 1 오후에 "숙소 체크인", 매일 마지막에 "숙소 복귀"를 포함하세요.
+      3. **동선 최적화:** 식사는 반드시 직전 방문지에서 도보 15분 이내의 거리로 배정하세요.
+
+      **[예약 링크(booking_url) 생성 규칙]**
+      - **링크 생성 대상 (O):** 테마파크, 유료 박물관, 공연, 고급 레스토랑(예약 필수), 체험 클래스.
+      - **링크 생성 금지 (X):** **공원(Park), 산책로, 숲, 거리**, 야시장, 쇼핑몰, 푸드코트, 일반 카페.
+      - **금지 대상은 반드시 booking_url을 null로 설정하세요.**
+      - 생성 시 포맷: "https://www.google.com/search?q=${destination}+[장소명]+예약"
 
       **[출력 형식 - JSON Only]**
-      반드시 아래 JSON 포맷으로만 출력하세요. 마크다운 기호(json)나 설명은 쓰지 마세요.
+      반드시 아래 JSON 포맷으로만 출력하세요.
       { 
-        "trip_title": "제목", 
+        "trip_title": "여행 제목", 
         "itinerary": [ 
           { 
             "day": 1, 
@@ -166,37 +177,58 @@ app.post('/api/generate-trip', async (req, res) => {
             "activities": [ 
               { 
                 "time": "HH:MM", 
-                "place_name": "장소명", 
-                "type": "관광/식사/카페", 
-                "activity_description": "활동 설명",
-                "booking_url": "URL 또는 null"
+                "place_name": "구체적인 장소명 (식당인 경우 반드시 상호명)", 
+                "type": "관광/식사/숙소", 
+                "activity_description": "설명",
+                "booking_url": "https://... 또는 null"
               } 
             ] 
           } 
         ] 
       }
     `;
-
+    
     const result = await model.generateContent(prompt);
     const text = result.response.text().replace(/```json|```/g, "").trim();
     const itineraryJson = JSON.parse(text);
 
-    // 3. 데이터 보정 (API 호출)
+    // 3. 데이터 보정 (숙소 허용, Places API 연동, 예약 링크 필터링)
     for (const dayPlan of itineraryJson.itinerary) {
       const enrichedActivities = [];
       for (const activity of dayPlan.activities) {
-        if (activity.type === "숙소" || activity.place_name.includes("이동")) {
-           enrichedActivities.push(activity);
-           continue;
+        
+        // 이동 제외
+        if (activity.place_name.includes("이동") && !activity.place_name.includes("숙소")) {
+             continue; 
         }
+
+        // 장소 정보 가져오기
         const details = await fetchPlaceDetails(activity.place_name);
+        
+        // ✨ [핵심 로직 1] 예약 링크 필터링 (API 검증)
+        // 구글이 식별한 장소 유형(types)에 공원, 자연 등이 포함되면 예약 링크 무조건 제거
+        const nonBookingTypes = ['park', 'natural_feature', 'point_of_interest', 'establishment', 'locality', 'political', 'sublocality'];
+        // point_of_interest는 너무 광범위하므로, tourist_attraction이나 museum이 없으면서 point_of_interest만 있는 경우 등을 체크해야 하지만,
+        // 여기서는 'park'(공원)나 'natural_feature'(자연)가 포함되면 확실히 제거합니다.
+        
+        if (details.types && (details.types.includes('park') || details.types.includes('natural_feature'))) {
+            activity.booking_url = null;
+        } else {
+             // ✨ [핵심 로직 2] 예약 링크 보완
+             // 공원이 아닌데 AI가 링크를 안 줬고, 공식 홈페이지가 있다면 채워넣기
+             if (!activity.booking_url && details.websiteUri) {
+                activity.booking_url = details.websiteUri;
+             }
+        }
+
         enrichedActivities.push({ ...activity, ...details });
       }
 
-      // 경로 계산 (이동 시간)
+      // 경로 계산
       for (let i = 1; i < enrichedActivities.length; i++) {
         const prev = enrichedActivities[i - 1];
         const curr = enrichedActivities[i];
+        
         if (prev.place_id && curr.place_id) {
           const routeInfo = await calculateRoute(prev.place_id, curr.place_id);
           if (routeInfo) curr.travel_info = routeInfo; 
@@ -252,7 +284,7 @@ app.get('/api/my-trips', async (req, res) => {
 // --- [API 3] 여행 일정 삭제 ---
 app.delete('/api/trip/:id', async (req, res) => {
   const { id } = req.params;
-  const { user_id } = req.body; // DELETE 요청도 body에 user_id 필요 (또는 헤더)
+  const { user_id } = req.body; 
   if (!user_id) return res.status(401).json({ error: "권한이 없습니다." });
 
   const { error } = await supabase
@@ -262,7 +294,6 @@ app.delete('/api/trip/:id', async (req, res) => {
     .eq('user_id', user_id);
 
   if (error) return res.status(500).json({ error: error.message });
-  
   res.status(200).json({ success: true, message: "삭제되었습니다." });
 });
 
