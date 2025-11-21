@@ -16,7 +16,7 @@ app.use(express.json());
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 // 모델은 최신 상황에 맞춰서 변경 가능 (예: gemini-pro 또는 gemini-1.5-flash 등)
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" }); 
+const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); 
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 
 // --- [설정] 등급별 월간 이용 한도 ---
