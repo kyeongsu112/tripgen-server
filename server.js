@@ -16,7 +16,7 @@ app.use(express.json());
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// 모델 설정 (최신 모델 사용)
+// 모델 설정 (최신 안정화 버전)
 const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); 
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 
@@ -35,7 +35,7 @@ function calculateDays(start, end) {
   return Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
 }
 
-// --- [Helper] 장소 상세 정보 조회 (Places API 강화됨) ---
+// --- [Helper] 장소 상세 정보 조회 (Places API) ---
 async function fetchPlaceDetails(placeName) {
   // "숙소 체크인" 등은 API 검색 제외
   if (placeName.includes("체크인") || placeName.includes("숙소") || placeName.includes("복귀")) {
@@ -50,7 +50,7 @@ async function fetchPlaceDetails(placeName) {
         headers: {
           "Content-Type": "application/json",
           "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
-          // ✨ [핵심 변경] places.types를 추가로 가져와서 장소 유형을 파악함
+          // ✨ websiteUri(공식홈피), googleMapsUri(지도링크), types(장소유형) 필수 요청
           "X-Goog-FieldMask": "places.id,places.photos,places.rating,places.userRatingCount,places.googleMapsUri,places.location,places.websiteUri,places.types" 
         }
       }
@@ -67,14 +67,14 @@ async function fetchPlaceDetails(placeName) {
 
     return {
       place_id: place.id,
-      place_name: placeName, // 구글이 인식한 정식 명칭
+      place_name: placeName, // 구글 정식 명칭
       rating: place.rating || "정보 없음",
       ratingCount: place.userRatingCount || 0,
       googleMapsUri: place.googleMapsUri || "#",
-      websiteUri: place.websiteUri || null,
+      websiteUri: place.websiteUri || null, // 공식 홈페이지
       location: place.location,
       photoUrl: photoUrl,
-      types: place.types || [] // 장소 유형 (park, restaurant 등)
+      types: place.types || [] 
     };
   } catch (error) {
     console.error(`⚠️ [${placeName}] 검색 실패:`, error.message);
@@ -104,7 +104,7 @@ async function calculateRoute(originId, destId) {
   }
 }
 
-// --- [API 1] 여행 일정 생성 (프롬프트 및 로직 대폭 수정) ---
+// --- [API 1] 여행 일정 생성 ---
 app.post('/api/generate-trip', async (req, res) => {
   try {
     const { destination, startDate, endDate, style, companions, arrivalTime, departureTime, user_id } = req.body;
@@ -112,22 +112,13 @@ app.post('/api/generate-trip', async (req, res) => {
     if (!user_id) return res.status(401).json({ error: "로그인이 필요합니다." });
 
     // 1. 사용량 제한 확인
-    let { data: userLimit } = await supabase
-      .from('user_limits')
-      .select('*')
-      .eq('user_id', user_id)
-      .single();
+    let { data: userLimit } = await supabase.from('user_limits').select('*').eq('user_id', user_id).single();
 
     if (!userLimit) {
-      const { data: newLimit } = await supabase
-        .from('user_limits')
-        .insert([{ user_id, tier: 'free', usage_count: 0 }])
-        .select()
-        .single();
+      const { data: newLimit } = await supabase.from('user_limits').insert([{ user_id, tier: 'free', usage_count: 0 }]).select().single();
       userLimit = newLimit;
     }
 
-    // 월별 초기화
     const today = new Date();
     const lastReset = new Date(userLimit.last_reset_date);
     if (today.getMonth() !== lastReset.getMonth() || today.getFullYear() !== lastReset.getFullYear()) {
@@ -140,10 +131,9 @@ app.post('/api/generate-trip', async (req, res) => {
       return res.status(403).json({ error: `이번 달 생성 한도(${limit}회)를 모두 사용하셨습니다.` });
     }
 
-    // totalDays 계산 (프롬프트보다 먼저)
     const totalDays = calculateDays(startDate, endDate);
 
-    // 2. 프롬프트 생성 (구체적 상호명 요구 & 예약 링크 로직 강화)
+    // 2. 프롬프트 생성
     const prompt = `
       여행지: ${destination}
       기간: ${startDate} 부터 ${endDate} 까지 (총 ${totalDays}일)
@@ -154,17 +144,15 @@ app.post('/api/generate-trip', async (req, res) => {
       1. Day 1: 도착 시간 **${arrivalTime || "오전 10:00"}** 이후부터 일정을 시작하세요.
       2. Day ${totalDays}: 출발 시간 **${departureTime || "오후 6:00"}** 3시간 전에는 공항으로 출발하도록 일정을 종료하세요.
 
-      **[일정 구성 요구사항 - 매우 중요]**
-      1. **구체적인 상호명 필수:** - "성수동 맛집", "근처 카페", "점심 식사" 같은 추상적인 표현을 **절대 금지**합니다.
-         - 반드시 **직전 관광지 근처의 실존하는 구체적인 식당 이름**(예: 소문난성수감자탕, 난포)을 지정하세요.
-      2. **숙소:** Day 1 오후에 "숙소 체크인", 매일 마지막에 "숙소 복귀"를 포함하세요.
-      3. **동선 최적화:** 식사는 반드시 직전 방문지에서 도보 15분 이내의 거리로 배정하세요.
+      **[일정 구성 요구사항]**
+      1. **구체적인 상호명 필수:** "성수동 맛집", "근처 카페" 등 추상적 표현 금지. 반드시 실존하는 식당/카페 이름을 명시하세요.
+      2. **숙소:** Day 1 오후에 "숙소 체크인", 매일 마지막에 "숙소 복귀" 포함.
+      3. **동선:** 식사는 직전 방문지에서 가까운 곳으로 배정하세요.
 
-      **[예약 링크(booking_url) 생성 규칙]**
-      - **링크 생성 대상 (O):** 테마파크, 유료 박물관, 공연, 고급 레스토랑(예약 필수), 체험 클래스.
-      - **링크 생성 금지 (X):** **공원(Park), 산책로, 숲, 거리**, 야시장, 쇼핑몰, 푸드코트, 일반 카페.
-      - **금지 대상은 반드시 booking_url을 null로 설정하세요.**
-      - 생성 시 포맷: "https://www.google.com/search?q=${destination}+[장소명]+예약"
+      **[is_booking_required 필드 판단 기준 (중요)]**
+      - **true:** 호텔/숙소, 테마파크, 유료 박물관, 공연, 고급 레스토랑(예약 필수), 체험 클래스, 티켓이 필요한 전망대.
+      - **false:** 공원, 산책로, 무료 관광지, 야시장, 푸드코트, 일반 카페, 예약 안 받는 일반 식당.
+      - **URL을 직접 만들지 마세요.** 예약 필요 여부(true/false)만 판단하세요.
 
       **[출력 형식 - JSON Only]**
       반드시 아래 JSON 포맷으로만 출력하세요.
@@ -177,10 +165,10 @@ app.post('/api/generate-trip', async (req, res) => {
             "activities": [ 
               { 
                 "time": "HH:MM", 
-                "place_name": "구체적인 장소명 (식당인 경우 반드시 상호명)", 
+                "place_name": "장소명 (식당은 반드시 상호명)", 
                 "type": "관광/식사/숙소", 
                 "activity_description": "설명",
-                "booking_url": "https://... 또는 null"
+                "is_booking_required": true 또는 false
               } 
             ] 
           } 
@@ -192,34 +180,41 @@ app.post('/api/generate-trip', async (req, res) => {
     const text = result.response.text().replace(/```json|```/g, "").trim();
     const itineraryJson = JSON.parse(text);
 
-    // 3. 데이터 보정 (숙소 허용, Places API 연동, 예약 링크 필터링)
+    // 3. 데이터 보정
     for (const dayPlan of itineraryJson.itinerary) {
       const enrichedActivities = [];
       for (const activity of dayPlan.activities) {
         
-        // 이동 제외
         if (activity.place_name.includes("이동") && !activity.place_name.includes("숙소")) {
              continue; 
         }
 
-        // 장소 정보 가져오기
+        // 장소 정보 조회 (Google Places API)
         const details = await fetchPlaceDetails(activity.place_name);
         
-        // ✨ [핵심 로직 1] 예약 링크 필터링 (API 검증)
-        // 구글이 식별한 장소 유형(types)에 공원, 자연 등이 포함되면 예약 링크 무조건 제거
-        const nonBookingTypes = ['park', 'natural_feature', 'point_of_interest', 'establishment', 'locality', 'political', 'sublocality'];
-        // point_of_interest는 너무 광범위하므로, tourist_attraction이나 museum이 없으면서 point_of_interest만 있는 경우 등을 체크해야 하지만,
-        // 여기서는 'park'(공원)나 'natural_feature'(자연)가 포함되면 확실히 제거합니다.
+        // ✨ [최종 URL 결정 로직 강화]
+        let finalBookingUrl = null;
+
+        // 1. 공원/자연이면 무조건 예약 없음 처리
+        const isPark = details.types && (details.types.includes('park') || details.types.includes('natural_feature'));
         
-        if (details.types && (details.types.includes('park') || details.types.includes('natural_feature'))) {
-            activity.booking_url = null;
-        } else {
-             // ✨ [핵심 로직 2] 예약 링크 보완
-             // 공원이 아닌데 AI가 링크를 안 줬고, 공식 홈페이지가 있다면 채워넣기
-             if (!activity.booking_url && details.websiteUri) {
-                activity.booking_url = details.websiteUri;
-             }
+        if (!isPark && activity.is_booking_required) {
+          // 2-1. 공식 홈페이지가 있으면 최우선 사용
+          if (details.websiteUri) {
+            finalBookingUrl = details.websiteUri;
+          } 
+          // 2-2. ✨ 공식 홈피는 없지만 '구글 지도 링크'가 있으면 사용 (호텔 가격비교 등에 유리)
+          else if (details.googleMapsUri) {
+            finalBookingUrl = details.googleMapsUri;
+          }
+          // 2-3. 둘 다 없으면 최후의 수단으로 검색 링크
+          else {
+            finalBookingUrl = `https://www.google.com/search?q=${destination}+${activity.place_name}+예약`;
+          }
         }
+
+        // activity 객체에 booking_url 필드 추가
+        activity.booking_url = finalBookingUrl;
 
         enrichedActivities.push({ ...activity, ...details });
       }
@@ -270,13 +265,7 @@ app.post('/api/generate-trip', async (req, res) => {
 app.get('/api/my-trips', async (req, res) => {
   const { user_id } = req.query;
   if (!user_id) return res.status(400).json({ error: "로그인이 필요합니다." });
-
-  const { data, error } = await supabase
-    .from('trip_plans')
-    .select('*')
-    .eq('user_id', user_id)
-    .order('created_at', { ascending: false });
-
+  const { data, error } = await supabase.from('trip_plans').select('*').eq('user_id', user_id).order('created_at', { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
   res.status(200).json({ success: true, data });
 });
@@ -286,24 +275,14 @@ app.delete('/api/trip/:id', async (req, res) => {
   const { id } = req.params;
   const { user_id } = req.body; 
   if (!user_id) return res.status(401).json({ error: "권한이 없습니다." });
-
-  const { error } = await supabase
-    .from('trip_plans')
-    .delete()
-    .eq('id', id)
-    .eq('user_id', user_id);
-
+  const { error } = await supabase.from('trip_plans').delete().eq('id', id).eq('user_id', user_id);
   if (error) return res.status(500).json({ error: error.message });
   res.status(200).json({ success: true, message: "삭제되었습니다." });
 });
 
 // --- [API 4] 관리자용: 모든 유저 조회 ---
 app.get('/api/admin/users', async (req, res) => {
-  const { data, error } = await supabase
-    .from('user_limits')
-    .select('*')
-    .order('created_at', { ascending: false });
-
+  const { data, error } = await supabase.from('user_limits').select('*').order('created_at', { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
   res.status(200).json({ success: true, data });
 });
@@ -312,13 +291,7 @@ app.get('/api/admin/users', async (req, res) => {
 app.put('/api/admin/user/tier', async (req, res) => {
   const { target_user_id, new_tier } = req.body;
   if (!target_user_id || !new_tier) return res.status(400).json({ error: "정보 부족" });
-
-  const { data, error } = await supabase
-    .from('user_limits')
-    .update({ tier: new_tier })
-    .eq('user_id', target_user_id)
-    .select();
-
+  const { data, error } = await supabase.from('user_limits').update({ tier: new_tier }).eq('user_id', target_user_id).select();
   if (error) return res.status(500).json({ error: error.message });
   res.status(200).json({ success: true, message: "등급 변경 완료", data });
 });
@@ -326,12 +299,7 @@ app.put('/api/admin/user/tier', async (req, res) => {
 // --- [API 6] 공유용: 공개 조회 ---
 app.get('/api/public/trip/:id', async (req, res) => {
   const { id } = req.params;
-  const { data, error } = await supabase
-    .from('trip_plans')
-    .select('*')
-    .eq('id', id)
-    .single();
-
+  const { data, error } = await supabase.from('trip_plans').select('*').eq('id', id).single();
   if (error) return res.status(404).json({ error: "일정을 찾을 수 없습니다." });
   res.status(200).json({ success: true, data });
 });
