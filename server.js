@@ -6,10 +6,8 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
-// Render 배포 환경 호환
 const PORT = process.env.PORT || 8080;
 
-// 데이터 용량 제한 늘림 (이미지 처리 등 대비)
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
@@ -29,18 +27,17 @@ function calculateDays(start, end) {
   return Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
 }
 
-// JSON 파싱 헬퍼 (안전장치)
 function cleanAndParseJSON(text) {
   try {
-    // ```json ... ``` 마크다운 제거
     const cleaned = text.replace(/```json/g, "").replace(/```/g, "").trim();
     return JSON.parse(cleaned);
   } catch (e) {
-    console.error("JSON Parse Fail. Raw Text Start:", text.substring(0, 500));
-    throw new Error("AI 응답이 올바르지 않습니다. 다시 시도해주세요.");
+    console.error("JSON Parse Fail:", text.substring(0, 500));
+    throw new Error("AI 응답 형식이 올바르지 않습니다.");
   }
 }
 
+// 장소 상세 정보 (Places API New)
 async function fetchPlaceDetails(placeName) {
   if (placeName.includes("체크인") || placeName.includes("숙소") || placeName.includes("복귀")) {
      return { place_name: placeName, type: "숙소" };
@@ -70,7 +67,7 @@ async function fetchPlaceDetails(placeName) {
 
     return {
       place_id: place.id,
-      place_name: place.displayName?.text || placeName, // 구글 정식 명칭
+      place_name: place.displayName?.text || placeName,
       rating: place.rating || "정보 없음",
       ratingCount: place.userRatingCount || 0,
       googleMapsUri: place.googleMapsUri || "#",
@@ -80,7 +77,7 @@ async function fetchPlaceDetails(placeName) {
       types: place.types || [] 
     };
   } catch (error) {
-    console.error(`⚠️ [${placeName}] 검색 실패:`, error.message);
+    console.error(`⚠️ 검색 실패: ${placeName}`);
     return { place_name: placeName };
   }
 }
@@ -102,13 +99,13 @@ async function calculateRoute(originId, destId) {
 
 // --- [API 1] 여행 일정 생성 ---
 app.post('/api/generate-trip', async (req, res) => {
-  console.log("Generate Trip Request Received");
+  console.log("Generate Request");
   try {
     const { destination, startDate, endDate, arrivalTime, departureTime, otherRequirements, user_id } = req.body;
 
     if (!user_id) return res.status(401).json({ error: "로그인이 필요합니다." });
 
-    // 사용자 제한 체크
+    // 유저 제한 확인
     let { data: userLimit } = await supabase.from('user_limits').select('*').eq('user_id', user_id).single();
     if (!userLimit) {
        const { data: newLimit } = await supabase.from('user_limits').insert([{ user_id, tier: 'free', usage_count: 0 }]).select().single(); 
@@ -130,43 +127,35 @@ app.post('/api/generate-trip', async (req, res) => {
 
     const totalDays = calculateDays(startDate, endDate);
 
-    // ✨ [프롬프트 수정] 시간 꽉 채우기 & 중복 금지 명령 강화
     const prompt = `
       여행지: ${destination}
       기간: ${startDate} ~ ${endDate} (총 ${totalDays}일)
       시간: ${arrivalTime} 시작, ${departureTime} 종료.
-      요청사항: "${otherRequirements || "없음"}"
+      ✨ 사용자 요청: "${otherRequirements || "없음"}"
 
-      **[🚨 일정 작성 필수 규칙 - 매우 중요]**
-      1. **시간 엄수:** 반드시 **아침(Morning)부터 저녁(Evening, 20:00~22:00)까지** 일정을 꽉 채우세요. 12시에 끝내지 마세요.
-      2. **중복 금지:** 같은 장소를 연속으로 방문하거나 하루에 두 번 넣지 마세요. (예: N서울타워 -> N서울타워 (X))
-      3. **구체적 상호명:** '맛집' 대신 '명동교자', '호텔' 대신 '신라스테이' 처럼 구체적으로 적으세요.
-      4. **동선:** 하루에 3~5곳 이상 방문하도록 알차게 구성하세요.
+      [규칙]
+      1. 아침~저녁(22시) 꽉 채운 일정.
+      2. **실존하는 구체적 상호명** 필수.
+      3. 중복 금지.
+      4. 상세 데이터(사진 등) 제외.
 
-      [출력 형식 - JSON]
+      [출력 JSON]
       { "trip_title": "제목", "itinerary": [ { "day": 1, "date": "YYYY-MM-DD", "activities": [ { "time": "HH:MM", "place_name": "장소명", "type": "관광/식사/숙소", "activity_description": "설명", "is_booking_required": true/false } ] } ] }
     `;
     
-    console.log("Calling Gemini for Generation...");
     const result = await model.generateContent({
       contents: [{ role: "user", parts: [{ text: prompt }] }],
       generationConfig: { responseMimeType: "application/json" }
     });
 
-    const text = result.response.text();
-    const itineraryJson = cleanAndParseJSON(text);
-    console.log("Gemini Response Parsed.");
+    const itineraryJson = cleanAndParseJSON(result.response.text());
 
-    console.log("Fetching Place Details (Parallel)...");
-    
+    // 병렬 처리
     await Promise.all(itineraryJson.itinerary.map(async (dayPlan) => {
-      
-      // ✨ [중복 제거 로직 추가] AI가 실수로 중복을 주더라도 여기서 거릅니다.
+      // 중복 제거
       const uniqueActivities = [];
       const seenPlaces = new Set();
-
       dayPlan.activities.forEach(act => {
-        // '이동'은 제외하고, 실제 장소 이름만 검사
         if (act.place_name.includes("이동") || act.place_name.includes("숙소")) {
             uniqueActivities.push(act);
         } else {
@@ -178,7 +167,6 @@ app.post('/api/generate-trip', async (req, res) => {
       });
       dayPlan.activities = uniqueActivities;
 
-      // 병렬 처리로 정보 가져오기
       const enrichedActivities = await Promise.all(dayPlan.activities.map(async (activity) => {
         if (activity.place_name.includes("이동") && !activity.place_name.includes("숙소")) return null; 
 
@@ -199,7 +187,6 @@ app.post('/api/generate-trip', async (req, res) => {
 
       dayPlan.activities = enrichedActivities.filter(a => a !== null);
 
-      // 경로 계산
       for (let i = 1; i < dayPlan.activities.length; i++) {
         const prev = dayPlan.activities[i - 1];
         const curr = dayPlan.activities[i];
@@ -210,7 +197,6 @@ app.post('/api/generate-trip', async (req, res) => {
       }
     }));
 
-    // 4. DB 저장
     const { data, error } = await supabase.from('trip_plans').insert([{ 
         destination, duration: `${startDate} ~ ${endDate}`, 
         style: "맞춤 여행", companions: "제한 없음", 
@@ -220,24 +206,20 @@ app.post('/api/generate-trip', async (req, res) => {
     if (error) throw error;
     await supabase.from('user_limits').update({ usage_count: userLimit.usage_count + 1 }).eq('user_id', user_id);
 
-    console.log("Trip Generated Successfully!");
     res.status(200).json({ success: true, data: data[0] });
 
   } catch (error) {
-    console.error("🔥 Generate Error:", error);
+    console.error("Generate Error:", error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// --- [API 2] 일정 수정 (Modify) ---
+// --- [API 2] 일정 수정 (Modify - 최적화됨) ---
 app.post('/api/modify-trip', async (req, res) => {
-  console.log("Modify Trip Request Received");
   try {
     const { currentItinerary, userRequest, destination, user_id } = req.body;
-
     if (!user_id) return res.status(401).json({ error: "권한이 없습니다." });
 
-    // AI에게 보낼 때는 무거운 데이터 제거 (토큰 절약)
     const simplifiedItinerary = {
       trip_title: currentItinerary.trip_title,
       itinerary: currentItinerary.itinerary.map(day => ({
@@ -253,37 +235,34 @@ app.post('/api/modify-trip', async (req, res) => {
       }))
     };
 
-    const prompt = `
-      당신은 여행 전문가입니다. 아래 일정을 사용자의 요청에 맞춰 수정해주세요.
-      
-      [여행지]: ${destination}
-      [기존 일정]: ${JSON.stringify(simplifiedItinerary)}
-      ✨ [수정 요청]: "${userRequest}"
-      
-      **[규칙]**
-      1. 요청 사항을 반영하되, 일정은 **저녁(20시~22시)까지 꽉 채워진 상태**를 유지하세요.
-      2. **같은 장소 반복 금지.**
-      3. **구체적 상호명 사용.**
+    // 기존 장소 캐싱 (재사용)
+    const existingPlacesMap = new Map();
+    currentItinerary.itinerary.forEach(day => {
+        day.activities.forEach(act => {
+            if (act.place_name && act.photoUrl) {
+                existingPlacesMap.set(act.place_name, act);
+            }
+        });
+    });
 
-      [출력] JSON 구조 유지. 오직 JSON만 출력.
+    const prompt = `
+      여행 전문가로서 일정을 수정해주세요.
+      [여행지]: ${destination}
+      [기존]: ${JSON.stringify(simplifiedItinerary)}
+      ✨ [수정 요청]: "${userRequest}"
+      [규칙] 저녁까지 채우기, 중복 금지, 구체적 상호명.
+      [출력] JSON Only.
     `;
 
-    console.log("Calling Gemini for Modification...");
     const result = await model.generateContent({
       contents: [{ role: "user", parts: [{ text: prompt }] }],
       generationConfig: { responseMimeType: "application/json" }
     });
 
-    const text = result.response.text();
-    const modifiedJson = cleanAndParseJSON(text);
-    console.log("Gemini Modification Parsed.");
+    const modifiedJson = cleanAndParseJSON(result.response.text());
 
-    // 수정된 일정 재검증
-    console.log("Verifying Modified Places (Parallel)...");
-    
     await Promise.all(modifiedJson.itinerary.map(async (dayPlan) => {
-      
-      // ✨ [중복 제거 로직 동일 적용]
+      // 중복 제거
       const uniqueActivities = [];
       const seenPlaces = new Set();
       dayPlan.activities.forEach(act => {
@@ -300,6 +279,12 @@ app.post('/api/modify-trip', async (req, res) => {
 
       const enrichedActivities = await Promise.all(dayPlan.activities.map(async (activity) => {
         if (activity.place_name.includes("이동") && !activity.place_name.includes("숙소")) return null;
+
+        // 캐시된 장소면 바로 사용 (API 호출 X) -> 속도 향상
+        if (existingPlacesMap.has(activity.place_name)) {
+            const cached = existingPlacesMap.get(activity.place_name);
+            return { ...cached, ...activity };
+        }
 
         const details = await fetchPlaceDetails(activity.place_name);
         
@@ -328,7 +313,6 @@ app.post('/api/modify-trip', async (req, res) => {
       }
     }));
 
-    console.log("Modification Complete!");
     res.status(200).json({ success: true, data: modifiedJson });
 
   } catch (error) {
@@ -337,31 +321,42 @@ app.post('/api/modify-trip', async (req, res) => {
   }
 });
 
-// --- [API 3] 자동완성 ---
+// --- [API 3] 자동완성 (Places API New + 도시/지역 필터) ✨ ---
 app.get('/api/places/autocomplete', async (req, res) => {
   const { query } = req.query;
-  if (!query) return res.status(400).json({ predictions: [] });
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+
+  if (!query) return res.status(200).json({ predictions: [] });
 
   try {
-    const response = await axios.get(
-      `https://maps.googleapis.com/maps/api/place/autocomplete/json`,
+    // ✅ Places API (New) 사용
+    const response = await axios.post(
+      `https://places.googleapis.com/v1/places:autocomplete`,
       {
-        params: {
-          input: query,
-          language: 'ko',
-          key: GOOGLE_MAPS_API_KEY
+        input: query,
+        languageCode: "ko",
+        // ✨ [핵심] '도시(locality)'와 '행정구역'만 검색하여 잡다한 장소 제외
+        includedPrimaryTypes: ["locality", "administrative_area_level_1", "administrative_area_level_2"]
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY
         }
       }
     );
     
-    if (response.data.status === 'OK') {
-      res.status(200).json({ predictions: response.data.predictions });
-    } else {
-      res.status(200).json({ predictions: [] });
-    }
+    const suggestions = response.data.suggestions || [];
+    const predictions = suggestions.map(item => ({
+      description: item.placePrediction.text.text, // 장소명
+      place_id: item.placePrediction.placeId       // 장소 ID
+    }));
+
+    res.status(200).json({ predictions });
+
   } catch (error) {
-    console.error("Autocomplete Error:", error.message);
-    res.status(500).json({ error: "자동완성 검색 실패" });
+    console.error("Autocomplete Error:", error.response?.data || error.message);
+    res.status(200).json({ predictions: [] });
   }
 });
 
