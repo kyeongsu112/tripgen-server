@@ -9,14 +9,14 @@ const app = express();
 // Render 배포 환경 호환
 const PORT = process.env.PORT || 8080;
 
-// JSON 데이터 용량 제한을 넉넉하게 설정 (혹시 모를 대용량 요청 대비)
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 // --- [설정] ---
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); 
+// 모델 설정 (최신 안정화 버전)
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" }); 
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 
 const TIER_LIMITS = { free: 3, pro: 30, admin: Infinity };
@@ -29,22 +29,20 @@ function calculateDays(start, end) {
   return Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
 }
 
-// JSON 파싱 헬퍼 (안전장치)
+// JSON 파싱 헬퍼
 function cleanAndParseJSON(text) {
   try {
-    // ```json ... ``` 마크다운 제거
     const cleaned = text.replace(/```json/g, "").replace(/```/g, "").trim();
     return JSON.parse(cleaned);
   } catch (e) {
-    console.error("JSON Parse Fail. Raw Text Length:", text.length);
-    // 에러가 나면 원본 텍스트의 앞부분만 로그에 찍어서 확인 (전체는 너무 길어서 잘림 방지)
-    console.error("Raw Text Start:", text.substring(0, 500));
+    console.error("JSON Parse Fail. Raw Text Start:", text.substring(0, 500));
     throw new Error("AI 응답이 올바르지 않습니다. 다시 시도해주세요.");
   }
 }
 
 async function fetchPlaceDetails(placeName) {
-  if (placeName.includes("체크인") || placeName.includes("숙소") || placeName.includes("복귀")) {
+  // 체크인 등은 검색 제외
+  if (placeName.includes("체크인") || placeName.includes("숙소 복귀")) {
      return { place_name: placeName, type: "숙소" };
   }
 
@@ -56,12 +54,14 @@ async function fetchPlaceDetails(placeName) {
         headers: {
           "Content-Type": "application/json",
           "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
-          "X-Goog-FieldMask": "places.id,places.photos,places.rating,places.userRatingCount,places.googleMapsUri,places.location,places.websiteUri,places.types" 
+          "X-Goog-FieldMask": "places.id,places.photos,places.rating,places.userRatingCount,places.googleMapsUri,places.location,places.websiteUri,places.types,places.displayName" 
         }
       }
     );
     
     const place = response.data.places && response.data.places[0];
+    
+    // 검색 결과가 없으면 원본 이름 그대로 반환
     if (!place) return { place_name: placeName }; 
 
     let photoUrl = null;
@@ -72,7 +72,8 @@ async function fetchPlaceDetails(placeName) {
 
     return {
       place_id: place.id,
-      place_name: placeName, // 구글 정식 명칭
+      // 구글에 등록된 정확한 업체명으로 덮어쓰기 (중요)
+      place_name: place.displayName?.text || placeName, 
       rating: place.rating || "정보 없음",
       ratingCount: place.userRatingCount || 0,
       googleMapsUri: place.googleMapsUri || "#",
@@ -131,21 +132,28 @@ app.post('/api/generate-trip', async (req, res) => {
 
     const totalDays = calculateDays(startDate, endDate);
 
-    // ✨ [수정됨] 프롬프트 최적화 (불필요한 필드 제거 요청)
+    // ✨ [프롬프트 강력 수정] 구체적 상호명 요구
     const prompt = `
       여행지: ${destination}
-      기간: ${startDate} 부터 ${endDate} 까지 (총 ${totalDays}일)
-      
-      [시간 제약] Day 1: ${arrivalTime} 시작, Day ${totalDays}: ${departureTime} 3시간 전 종료.
-      ✨ [사용자 요청]: "${otherRequirements || "없음"}" (최우선 반영)
+      기간: ${startDate} ~ ${endDate} (총 ${totalDays}일)
+      시간: ${arrivalTime} 시작, ${departureTime} 종료.
+      ✨ 사용자 요청: "${otherRequirements || "없음"}" (최우선 반영)
 
-      [작성 규칙]
-      1. 장소명은 정확한 상호명으로 작성.
-      2. photoUrl, rating, location, place_id 필드는 **절대 작성하지 마세요**. (제가 채울 겁니다)
-      3. 오직 장소명, 시간, 설명, 예약필요여부만 JSON으로 주세요.
+      **[🚨 장소명 작성 절대 규칙 - 매우 중요]**
+      1. **추상적인 표현 금지:** '수원 통닭거리', '시내 호텔', '근처 카페', '맛있는 횟집' 같은 표현을 절대 쓰지 마세요.
+      2. **구체적인 상호명 필수:** 반드시 실제로 존재하는 **특정 가게 이름**을 적으세요.
+         - (X) 수원 통닭거리 -> (O) 진미통닭
+         - (X) 부산 호텔 -> (O) 파라다이스 호텔 부산
+         - (X) 성수동 카페 -> (O) 어니언 성수
+         - (X) 점심 식사 -> (O) 명동교자 본점
+      3. 숙소도 반드시 **구체적인 호텔/숙소 이름**을 지정하세요. (예: '숙소 체크인 (신라스테이 해운대)')
+
+      [기타 규칙]
+      - photoUrl, rating, location 등 데이터 필드는 비워두거나 제외하세요. (백엔드가 채움)
+      - 예약이 필수인 곳(호텔, 파인다이닝, 테마파크)만 is_booking_required: true
 
       [출력 형식 - JSON]
-      { "trip_title": "제목", "itinerary": [ { "day": 1, "date": "YYYY-MM-DD", "activities": [ { "time": "HH:MM", "place_name": "장소명", "type": "관광/식사/숙소", "activity_description": "설명", "is_booking_required": true/false } ] } ] }
+      { "trip_title": "제목", "itinerary": [ { "day": 1, "date": "YYYY-MM-DD", "activities": [ { "time": "HH:MM", "place_name": "구체적상호명", "type": "관광/식사/숙소", "activity_description": "설명", "is_booking_required": true/false } ] } ] }
     `;
     
     console.log("Calling Gemini for Generation...");
@@ -165,8 +173,10 @@ app.post('/api/generate-trip', async (req, res) => {
       const enrichedActivities = await Promise.all(dayPlan.activities.map(async (activity) => {
         if (activity.place_name.includes("이동") && !activity.place_name.includes("숙소")) return null; 
 
+        // 장소 정보 조회
         const details = await fetchPlaceDetails(activity.place_name);
         
+        // 스마트 링크 로직
         let finalBookingUrl = null;
         const isPark = details.types && (details.types.includes('park') || details.types.includes('natural_feature'));
         
@@ -177,7 +187,8 @@ app.post('/api/generate-trip', async (req, res) => {
         }
         activity.booking_url = finalBookingUrl;
 
-        return { ...activity, ...details };
+        // ✨ [중요] details에서 가져온 '정확한 구글 지도 상호명'으로 place_name을 교체 (오타 보정 효과)
+        return { ...activity, ...details, place_name: details.place_name || activity.place_name };
       }));
 
       dayPlan.activities = enrichedActivities.filter(a => a !== null);
@@ -212,7 +223,7 @@ app.post('/api/generate-trip', async (req, res) => {
   }
 });
 
-// --- [API 2] 일정 수정 (Modify) - 안정성 강화 ✨ ---
+// --- [API 2] 일정 수정 (Modify) ---
 app.post('/api/modify-trip', async (req, res) => {
   console.log("Modify Trip Request Received");
   try {
@@ -220,8 +231,6 @@ app.post('/api/modify-trip', async (req, res) => {
 
     if (!user_id) return res.status(401).json({ error: "권한이 없습니다." });
 
-    // ✨ [중요] AI에게 보낼 때는 무거운 데이터(사진 등)를 제거하고 보냅니다.
-    // 그래야 토큰 제한에 걸리지 않고, AI가 헷갈려서 이상한 JSON을 만들지 않습니다.
     const simplifiedItinerary = {
       trip_title: currentItinerary.trip_title,
       itinerary: currentItinerary.itinerary.map(day => ({
@@ -237,18 +246,21 @@ app.post('/api/modify-trip', async (req, res) => {
       }))
     };
 
+    // ✨ [프롬프트 강력 수정] 수정 시에도 구체적 상호명 요구
     const prompt = `
-      당신은 여행 전문가입니다. 아래 기존 여행 일정을 사용자의 요청에 맞춰 수정해주세요.
+      당신은 여행 전문가입니다. 아래 일정을 사용자의 요청에 맞춰 수정해주세요.
       
       [여행지]: ${destination}
-      [기존 일정 (간략본)]: ${JSON.stringify(simplifiedItinerary)}
+      [기존 일정]: ${JSON.stringify(simplifiedItinerary)}
       ✨ [수정 요청]: "${userRequest}"
       
-      [작성 규칙]
-      1. 사용자의 요청을 반영하여 일정(장소, 시간, 순서 등)을 변경하세요.
-      2. photoUrl, rating, location, place_id 등 **상세 정보 필드는 절대 포함하지 마세요.** (오직 장소명만 바꾸면 됩니다)
-      3. JSON 구조는 기존과 완벽하게 동일해야 합니다.
-      4. 오직 JSON만 출력하세요.
+      **[🚨 장소명 작성 절대 규칙]**
+      1. **추상적 표현 금지:** '근처 맛집', '시내 카페', '유명한 식당' (X)
+      2. **구체적 상호명 필수:** '다운타우너 버거', '블루보틀 성수', '롯데호텔 서울' (O)
+      3. 사용자가 '맛집 추천해줘'라고 하면, 반드시 **실존하는 특정 식당 이름**으로 바꿔주세요.
+
+      [출력 형식]
+      JSON 구조 유지. 오직 JSON만 출력.
     `;
 
     console.log("Calling Gemini for Modification...");
@@ -280,7 +292,8 @@ app.post('/api/modify-trip', async (req, res) => {
         }
         activity.booking_url = finalBookingUrl;
 
-        return { ...activity, ...details };
+        // ✨ [중요] 구글 지도에서 가져온 정확한 명칭으로 교체
+        return { ...activity, ...details, place_name: details.place_name || activity.place_name };
       }));
 
       dayPlan.activities = enrichedActivities.filter(a => a !== null);
@@ -300,7 +313,7 @@ app.post('/api/modify-trip', async (req, res) => {
 
   } catch (error) {
     console.error("Modify Error:", error);
-    res.status(500).json({ success: false, error: "수정 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요." });
+    res.status(500).json({ success: false, error: "수정 중 오류가 발생했습니다." });
   }
 });
 
