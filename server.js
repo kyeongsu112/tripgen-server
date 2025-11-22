@@ -16,7 +16,7 @@ app.use(express.json({ limit: '10mb' }));
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 // 모델 설정 (최신 안정화 버전)
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" }); 
+const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); 
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 
 const TIER_LIMITS = { free: 3, pro: 30, admin: Infinity };
