@@ -149,6 +149,7 @@ app.post('/api/generate-trip', async (req, res) => {
       await supabase.from('user_limits').update({ usage_count: 0, last_reset_date: new Date() }).eq('user_id', user_id);
     }
 
+    const limit = TIER_LIMITS[userLimit.tier] || 3;
     // 한도 체크는 프론트엔드 광고 로직으로 위임
 
     const totalDays = calculateDays(startDate, endDate);
@@ -324,7 +325,6 @@ app.post('/api/modify-trip', async (req, res) => {
             return { ...cached, ...activity };
         }
 
-        // destination 전달하여 검색 범위 고정
         const details = await fetchPlaceDetails(activity.place_name, destination);
         let finalBookingUrl = null;
         const isPark = details.types && (details.types.includes('park') || details.types.includes('natural_feature'));
@@ -376,7 +376,7 @@ app.get('/api/places/autocomplete', async (req, res) => {
       {
         input: query,
         languageCode: "ko",
-        // 도시/지역만 검색되도록 필터링 (야시장, 호텔 제외)
+        // ✨ 도시/지역만 검색되도록 필터링 (야시장, 호텔 제외)
         includedPrimaryTypes: ["locality", "administrative_area_level_1", "administrative_area_level_2"]
       },
       {
@@ -415,6 +415,7 @@ app.delete('/api/auth/delete', async (req, res) => {
     await supabase.from('suggestions').delete().eq('user_id', user_id); 
     await supabase.from('community').delete().eq('user_id', user_id); // ✨ 커뮤니티 글도 삭제
 
+    // ✨ Supabase Auth 유저 영구 삭제 (Service Key 필요)
     const { error: deleteError } = await supabaseAdmin.auth.admin.deleteUser(user_id);
     if (deleteError) throw deleteError;
 
@@ -454,7 +455,7 @@ app.post('/api/board', async (req, res) => {
 
 app.delete('/api/board/:id', async (req, res) => {
   const { id } = req.params;
-  const { user_id, email } = req.body; // 요청자 정보
+  const { user_id, email } = req.body;
   
   try {
     // 관리자 삭제
@@ -462,7 +463,7 @@ app.delete('/api/board/:id', async (req, res) => {
          await supabaseAdmin.from('suggestions').delete().eq('id', id);
          return res.status(200).json({ success: true });
     }
-    // 일반 유저 삭제 (본인 글)
+    // 본인 삭제
     if (!user_id) return res.status(403).json({ error: "권한 없음" });
     const { error } = await supabase.from('suggestions').delete().eq('id', id).eq('user_id', user_id);
     if (error) throw error;
@@ -472,7 +473,7 @@ app.delete('/api/board/:id', async (req, res) => {
   }
 });
 
-// --- [API 6] 공유 게시판 (Community) - ✨ 추가됨 ---
+// --- [API 6] 공유 게시판 (Community) ---
 app.get('/api/community', async (req, res) => {
   try {
     const { data, error } = await supabase.from('community').select('*').order('created_at', { ascending: false });
