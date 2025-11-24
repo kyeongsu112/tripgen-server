@@ -6,12 +6,14 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
+// Render 배포 환경 호환
 const PORT = process.env.PORT || 8080;
 
+// 대용량 데이터 처리를 위해 limit 설정 증가
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-// --- [설정] ---
+// --- [설정 확인 및 초기화] ---
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); 
@@ -27,12 +29,13 @@ function calculateDays(start, end) {
   return Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
 }
 
+// JSON 파싱 헬퍼
 function cleanAndParseJSON(text) {
   try {
     const cleaned = text.replace(/```json/g, "").replace(/```/g, "").trim();
     return JSON.parse(cleaned);
   } catch (e) {
-    console.error("JSON Parse Fail:", text.substring(0, 500));
+    console.error("JSON Parse Fail. Raw Text Start:", text.substring(0, 500));
     throw new Error("AI 응답 형식이 올바르지 않습니다.");
   }
 }
@@ -41,6 +44,7 @@ async function fetchPlaceDetails(placeName) {
   if (placeName.includes("체크인") || placeName.includes("숙소") || placeName.includes("복귀")) {
      return { place_name: placeName, type: "숙소" };
   }
+
   try {
     const response = await axios.post(
       `https://places.googleapis.com/v1/places:searchText`,
@@ -53,6 +57,7 @@ async function fetchPlaceDetails(placeName) {
         }
       }
     );
+    
     const place = response.data.places && response.data.places[0];
     if (!place) return { place_name: placeName }; 
 
@@ -61,6 +66,7 @@ async function fetchPlaceDetails(placeName) {
       const photoReference = place.photos[0].name;
       photoUrl = `https://places.googleapis.com/v1/${photoReference}/media?key=${GOOGLE_MAPS_API_KEY}&maxHeightPx=400&maxWidthPx=400`;
     }
+
     return {
       place_id: place.id,
       place_name: place.displayName?.text || placeName,
@@ -73,6 +79,7 @@ async function fetchPlaceDetails(placeName) {
       types: place.types || [] 
     };
   } catch (error) {
+    console.error(`⚠️ 검색 실패: ${placeName}`);
     return { place_name: placeName };
   }
 }
@@ -94,12 +101,13 @@ async function calculateRoute(originId, destId) {
 
 // --- [API 1] 여행 일정 생성 ---
 app.post('/api/generate-trip', async (req, res) => {
-  console.log("Generate Trip Request Received");
+  console.log("Generate Request");
   try {
     const { destination, startDate, endDate, arrivalTime, departureTime, otherRequirements, user_id } = req.body;
 
     if (!user_id) return res.status(401).json({ error: "로그인이 필요합니다." });
 
+    // 유저 제한 확인
     let { data: userLimit } = await supabase.from('user_limits').select('*').eq('user_id', user_id).single();
     if (!userLimit) {
        const { data: newLimit } = await supabase.from('user_limits').insert([{ user_id, tier: 'free', usage_count: 0 }]).select().single(); 
@@ -120,34 +128,39 @@ app.post('/api/generate-trip', async (req, res) => {
 
     const totalDays = calculateDays(startDate, endDate);
 
+    // ✨ [핵심] 당일치기 시간 제약 처리
+    let timeConstraint = "";
+    if (totalDays === 1) {
+        timeConstraint = `**[🚨 당일치기 필수 규칙]**\n1. 일정은 반드시 **${arrivalTime}에 시작**해서 **${departureTime}에 종료**되어야 합니다.\n2. ${arrivalTime} 이전이나 ${departureTime} 이후의 일정은 생성하지 마세요.`;
+    } else {
+        timeConstraint = `**[시간 규칙]**\n1. Day 1: ${arrivalTime} 이후 시작.\n2. Day ${totalDays}: ${departureTime} 이전 종료.\n3. 나머지 날: 아침부터 저녁(22시)까지 꽉 채움.`;
+    }
+
     const prompt = `
       여행지: ${destination}
       기간: ${startDate} ~ ${endDate} (총 ${totalDays}일)
-      시간: ${arrivalTime} 시작, ${departureTime} 종료.
+      ${timeConstraint}
       ✨ 사용자 요청: "${otherRequirements || "없음"}" (최우선 반영)
 
-      [규칙]
-      1. 시간: 아침부터 저녁(20~22시)까지 꽉 채우세요.
-      2. 장소: 반드시 **실존하는 구체적 상호명** 필수.
-      3. 중복: 같은 장소 반복 금지.
-      4. 데이터: photoUrl 등 상세 정보는 적지 마세요.
+      [일정 생성 규칙]
+      1. **장소:** '맛집' 같은 추상적 표현 금지. 반드시 **실존하는 구체적 상호명** 기입.
+      2. **중복:** 같은 장소 반복 금지.
+      3. **데이터:** photoUrl 등 상세 정보 필드는 비워두세요.
 
-      [출력 형식 - JSON]
+      [출력 JSON]
       { "trip_title": "제목", "itinerary": [ { "day": 1, "date": "YYYY-MM-DD", "activities": [ { "time": "HH:MM", "place_name": "장소명", "type": "관광/식사/숙소", "activity_description": "설명", "is_booking_required": true/false } ] } ] }
     `;
     
-    console.log("Calling Gemini for Generation...");
     const result = await model.generateContent({
       contents: [{ role: "user", parts: [{ text: prompt }] }],
       generationConfig: { responseMimeType: "application/json" }
     });
 
-    const text = result.response.text();
-    const itineraryJson = cleanAndParseJSON(text);
+    const itineraryJson = cleanAndParseJSON(result.response.text());
 
-    console.log("Fetching Details (Parallel)...");
-    
+    // 병렬 처리
     await Promise.all(itineraryJson.itinerary.map(async (dayPlan) => {
+      // 중복 제거
       const uniqueActivities = [];
       const seenPlaces = new Set();
       dayPlan.activities.forEach(act => {
@@ -201,20 +214,17 @@ app.post('/api/generate-trip', async (req, res) => {
     if (error) throw error;
     await supabase.from('user_limits').update({ usage_count: userLimit.usage_count + 1 }).eq('user_id', user_id);
 
-    console.log("Trip Generated Successfully!");
     res.status(200).json({ success: true, data: data[0] });
 
   } catch (error) {
-    console.error("🔥 Generate Error:", error);
+    console.error("Generate Error:", error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// --- [API 2] 일정 수정 (Modify) - ✨ DB 저장 추가됨 ---
+// --- [API 2] 일정 수정 (Modify - DB 저장 포함) ---
 app.post('/api/modify-trip', async (req, res) => {
-  console.log("Modify Trip Request Received");
   try {
-    // ✨ trip_id 추가됨: 수정한 일정을 DB에 저장하기 위해 필요
     const { trip_id, currentItinerary, userRequest, destination, user_id } = req.body;
 
     if (!user_id) return res.status(401).json({ error: "권한이 없습니다." });
@@ -248,7 +258,7 @@ app.post('/api/modify-trip', async (req, res) => {
       [여행지]: ${destination}
       [기존]: ${JSON.stringify(simplifiedItinerary)}
       ✨ [수정 요청]: "${userRequest}"
-      [규칙] 저녁까지 채우기, 중복 금지, 구체적 상호명.
+      [규칙] 시간 준수, 중복 금지, 구체적 상호명.
       [출력] JSON Only.
     `;
 
@@ -259,7 +269,6 @@ app.post('/api/modify-trip', async (req, res) => {
 
     const modifiedJson = cleanAndParseJSON(result.response.text());
 
-    console.log("Verifying Modified Places...");
     await Promise.all(modifiedJson.itinerary.map(async (dayPlan) => {
       const uniqueActivities = [];
       const seenPlaces = new Set();
@@ -278,12 +287,14 @@ app.post('/api/modify-trip', async (req, res) => {
       const enrichedActivities = await Promise.all(dayPlan.activities.map(async (activity) => {
         if (activity.place_name.includes("이동") && !activity.place_name.includes("숙소")) return null;
 
+        // 기존 정보 재사용 (속도 향상)
         if (existingPlacesMap.has(activity.place_name)) {
             const cached = existingPlacesMap.get(activity.place_name);
             return { ...cached, ...activity };
         }
 
         const details = await fetchPlaceDetails(activity.place_name);
+        
         let finalBookingUrl = null;
         const isPark = details.types && (details.types.includes('park') || details.types.includes('natural_feature'));
         
@@ -309,20 +320,9 @@ app.post('/api/modify-trip', async (req, res) => {
       }
     }));
 
-    // ✨ [핵심 추가] 수정된 일정을 DB에 업데이트 (저장)
+    // ✨ DB 업데이트 (저장)
     if (trip_id) {
-        const { error } = await supabase
-            .from('trip_plans')
-            .update({ itinerary_data: modifiedJson })
-            .eq('id', trip_id)
-            .eq('user_id', user_id); // 보안: 본인 것만 수정 가능
-
-        if (error) {
-            console.error("DB Update Failed:", error);
-            // 에러가 나도 클라이언트에는 결과를 보여주긴 함 (경고 로그)
-        } else {
-            console.log("DB Updated Successfully!");
-        }
+        await supabase.from('trip_plans').update({ itinerary_data: modifiedJson }).eq('id', trip_id).eq('user_id', user_id);
     }
 
     res.status(200).json({ success: true, data: modifiedJson });
@@ -333,7 +333,7 @@ app.post('/api/modify-trip', async (req, res) => {
   }
 });
 
-// --- [API 3] 자동완성 ---
+// --- [API 3] 자동완성 (Places API New) ---
 app.get('/api/places/autocomplete', async (req, res) => {
   const { query } = req.query;
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
@@ -346,6 +346,7 @@ app.get('/api/places/autocomplete', async (req, res) => {
       {
         input: query,
         languageCode: "ko",
+        // ✨ 도시/지역만 검색되도록 필터링
         includedPrimaryTypes: ["locality", "administrative_area_level_1", "administrative_area_level_2"]
       },
       {
