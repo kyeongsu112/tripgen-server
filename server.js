@@ -16,9 +16,8 @@ app.use(express.json({ limit: '10mb' }));
 // --- [설정 확인 및 초기화] ---
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// 1. 일반 클라이언트 (조회 및 본인 데이터 수정용 - RLS 적용됨)
+// 1. 일반 클라이언트 (조회 및 본인 데이터 수정용)
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-
 // 2. 관리자 클라이언트 (회원 삭제 및 관리자 권한 작업용 - Service Role Key 필수)
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL, 
@@ -40,7 +39,6 @@ function calculateDays(start, end) {
   return Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
 }
 
-// JSON 파싱 헬퍼
 function cleanAndParseJSON(text) {
   try {
     const cleaned = text.replace(/```json/g, "").replace(/```/g, "").trim();
@@ -150,6 +148,8 @@ app.post('/api/generate-trip', async (req, res) => {
       userLimit.usage_count = 0;
       await supabase.from('user_limits').update({ usage_count: 0, last_reset_date: new Date() }).eq('user_id', user_id);
     }
+
+    // 한도 체크는 프론트엔드 광고 로직으로 위임
 
     const totalDays = calculateDays(startDate, endDate);
 
@@ -324,6 +324,7 @@ app.post('/api/modify-trip', async (req, res) => {
             return { ...cached, ...activity };
         }
 
+        // destination 전달하여 검색 범위 고정
         const details = await fetchPlaceDetails(activity.place_name, destination);
         let finalBookingUrl = null;
         const isPark = details.types && (details.types.includes('park') || details.types.includes('natural_feature'));
@@ -375,7 +376,7 @@ app.get('/api/places/autocomplete', async (req, res) => {
       {
         input: query,
         languageCode: "ko",
-        // ✨ 도시/지역만 검색되도록 필터링 (야시장, 호텔 제외)
+        // 도시/지역만 검색되도록 필터링 (야시장, 호텔 제외)
         includedPrimaryTypes: ["locality", "administrative_area_level_1", "administrative_area_level_2"]
       },
       {
@@ -406,16 +407,14 @@ app.delete('/api/auth/delete', async (req, res) => {
   if (!user_id) return res.status(400).json({ error: "User ID Required" });
 
   try {
-    // 1. 차단 리스트 등록
     if (email) {
       await supabase.from('deleted_users').insert([{ email: email }]);
     }
-    // 2. 모든 데이터 삭제
     await supabase.from('trip_plans').delete().eq('user_id', user_id);
     await supabase.from('user_limits').delete().eq('user_id', user_id);
-    await supabase.from('suggestions').delete().eq('user_id', user_id); // 게시글도 삭제
+    await supabase.from('suggestions').delete().eq('user_id', user_id); 
+    await supabase.from('community').delete().eq('user_id', user_id); // ✨ 커뮤니티 글도 삭제
 
-    // 3. ✨ Supabase Auth 유저 영구 삭제 (Service Key 필요)
     const { error: deleteError } = await supabaseAdmin.auth.admin.deleteUser(user_id);
     if (deleteError) throw deleteError;
 
@@ -425,8 +424,7 @@ app.delete('/api/auth/delete', async (req, res) => {
   }
 });
 
-// --- [API 5] 건의사항 게시판 (익명 허용 & 관리자 삭제) ---
-// 1. 조회
+// --- [API 5] 건의사항 게시판 ---
 app.get('/api/board', async (req, res) => {
   try {
     const { data, error } = await supabase.from('suggestions').select('*').order('created_at', { ascending: false });
@@ -437,7 +435,6 @@ app.get('/api/board', async (req, res) => {
   }
 });
 
-// 2. 작성 (익명 가능)
 app.post('/api/board', async (req, res) => {
   const { user_id, email, content } = req.body;
   if (!content) return res.status(400).json({ error: "내용 부족" });
@@ -455,23 +452,73 @@ app.post('/api/board', async (req, res) => {
   }
 });
 
-// 3. 삭제 (관리자 강제 삭제 + 본인 삭제)
 app.delete('/api/board/:id', async (req, res) => {
   const { id } = req.params;
-  const { user_id, email } = req.body;
+  const { user_id, email } = req.body; // 요청자 정보
   
   try {
-    // ✨ 관리자(ADMIN_EMAIL)라면 -> supabaseAdmin으로 강제 삭제 (RLS 무시)
+    // 관리자 삭제
     if (email === ADMIN_EMAIL) {
-         const { error } = await supabaseAdmin.from('suggestions').delete().eq('id', id);
-         if (error) throw error;
+         await supabaseAdmin.from('suggestions').delete().eq('id', id);
          return res.status(200).json({ success: true });
     }
-
-    // 일반 유저라면 -> 본인 글인지 확인 (RLS 적용됨)
-    if (!user_id) return res.status(403).json({ error: "권한이 없습니다." });
+    // 일반 유저 삭제 (본인 글)
+    if (!user_id) return res.status(403).json({ error: "권한 없음" });
     const { error } = await supabase.from('suggestions').delete().eq('id', id).eq('user_id', user_id);
+    if (error) throw error;
+    res.status(200).json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- [API 6] 공유 게시판 (Community) - ✨ 추가됨 ---
+app.get('/api/community', async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('community').select('*').order('created_at', { ascending: false });
+    if (error) throw error;
+    res.status(200).json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/community', async (req, res) => {
+  const { user_id, email, nickname, content, is_anonymous } = req.body;
+  
+  if (!content) return res.status(400).json({ error: "내용 입력" });
+  if (!user_id) return res.status(401).json({ error: "로그인 필요" });
+
+  try {
+    const { data, error } = await supabase.from('community').insert([{ 
+        user_id, 
+        email, 
+        nickname: nickname || email.split('@')[0],
+        content, 
+        is_anonymous 
+    }]).select();
+
+    if (error) throw error;
+    res.status(200).json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/community/:id', async (req, res) => {
+  const { id } = req.params;
+  const { user_id, email } = req.body;
+
+  try {
+    // 관리자 삭제
+    if (email === ADMIN_EMAIL) {
+         await supabaseAdmin.from('community').delete().eq('id', id);
+         return res.status(200).json({ success: true });
+    }
+    // 본인 삭제
+    if (!user_id) return res.status(403).json({ error: "권한 없음" });
     
+    const { error } = await supabase.from('community').delete().eq('id', id).eq('user_id', user_id);
     if (error) throw error;
     res.status(200).json({ success: true });
   } catch (error) {
