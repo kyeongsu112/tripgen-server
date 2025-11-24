@@ -19,7 +19,10 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 // 1. 일반 클라이언트 (조회 및 본인 데이터 수정용)
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 // 2. 관리자 클라이언트 (회원 삭제 및 관리자 권한 작업용 - Service Role Key 필수)
-const supabaseAdmin = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY);
+const supabaseAdmin = createClient(
+  process.env.SUPABASE_URL, 
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY
+);
 
 const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); 
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
@@ -147,7 +150,8 @@ app.post('/api/generate-trip', async (req, res) => {
       await supabase.from('user_limits').update({ usage_count: 0, last_reset_date: new Date() }).eq('user_id', user_id);
     }
 
-    const limit = TIER_LIMITS[userLimit.tier] || 3;
+    // const limit = TIER_LIMITS[userLimit.tier] || 3;
+    // 한도 체크는 프론트엔드 광고 로직으로 위임
 
     const totalDays = calculateDays(startDate, endDate);
 
@@ -269,6 +273,7 @@ app.post('/api/modify-trip', async (req, res) => {
       }))
     };
 
+    // 캐싱 (재사용)
     const existingPlacesMap = new Map();
     currentItinerary.itinerary.forEach(day => {
         day.activities.forEach(act => {
@@ -324,7 +329,6 @@ app.post('/api/modify-trip', async (req, res) => {
         const details = await fetchPlaceDetails(activity.place_name, destination);
         let finalBookingUrl = null;
         const isPark = details.types && (details.types.includes('park') || details.types.includes('natural_feature'));
-        
         if (!isPark && activity.is_booking_required) {
           if (details.websiteUri) finalBookingUrl = details.websiteUri;
           else if (details.googleMapsUri) finalBookingUrl = details.googleMapsUri;
@@ -347,7 +351,7 @@ app.post('/api/modify-trip', async (req, res) => {
       }
     }));
 
-    // ✨ DB 업데이트
+    // DB 업데이트
     if (trip_id) {
         await supabase.from('trip_plans').update({ itinerary_data: modifiedJson }).eq('id', trip_id).eq('user_id', user_id);
     }
@@ -398,7 +402,7 @@ app.get('/api/places/autocomplete', async (req, res) => {
   }
 });
 
-// --- [API 4] 회원 탈퇴 (완전 삭제) ---
+// --- [API 4] 회원 탈퇴 ---
 app.delete('/api/auth/delete', async (req, res) => {
   const { user_id, email } = req.body;
   if (!user_id) return res.status(400).json({ error: "User ID Required" });
@@ -421,7 +425,7 @@ app.delete('/api/auth/delete', async (req, res) => {
   }
 });
 
-// --- [API 5] 건의사항 게시판 (수정됨: 관리자만 삭제) ---
+// --- [API 5] 건의사항 게시판 (관리자 삭제 기능 강화) ---
 // 1. 조회
 app.get('/api/board', async (req, res) => {
   try {
