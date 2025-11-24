@@ -15,9 +15,15 @@ app.use(express.json({ limit: '10mb' }));
 
 // --- [설정 확인 및 초기화] ---
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+// 1. 일반 클라이언트
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+// 2. 관리자 클라이언트 (회원 완전 삭제 및 관리자 권한 작업용)
+const supabaseAdmin = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY);
+
 const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); 
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
+// ✨ [수정됨] 환경변수에서 관리자 이메일 가져오기 (하드코딩 제거)
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
 
 const TIER_LIMITS = { free: 3, pro: 30, admin: Infinity };
 
@@ -29,7 +35,6 @@ function calculateDays(start, end) {
   return Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
 }
 
-// JSON 파싱 헬퍼
 function cleanAndParseJSON(text) {
   try {
     const cleaned = text.replace(/```json/g, "").replace(/```/g, "").trim();
@@ -46,9 +51,7 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
   }
 
   try {
-    // "도시명 + 장소명"으로 검색하여 다른 지역 검색 방지
     const query = cityContext ? `${cityContext} ${placeName}` : placeName;
-
     const response = await axios.post(
       `https://places.googleapis.com/v1/places:searchText`,
       { textQuery: query, languageCode: "ko" },
@@ -72,7 +75,7 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
 
     return {
       place_id: place.id,
-      place_name: place.displayName?.text || placeName, // 구글 정식 명칭 사용
+      place_name: place.displayName?.text || placeName,
       rating: place.rating || "정보 없음",
       ratingCount: place.userRatingCount || 0,
       googleMapsUri: place.googleMapsUri || "#",
@@ -87,7 +90,6 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
   }
 }
 
-// 경로 계산 (3단계 시도: 대중교통 -> 운전 -> 도보)
 async function calculateRoute(originId, destId) {
   if (!originId || !destId) return null;
   const modes = ['transit', 'driving', 'walking'];
@@ -109,7 +111,7 @@ async function calculateRoute(originId, destId) {
   return null;
 }
 
-// --- [API 1] 여행 일정 생성 (Generate) ---
+// --- [API 1] 여행 일정 생성 ---
 app.post('/api/generate-trip', async (req, res) => {
   console.log("Generate Trip Request Received");
   try {
@@ -117,21 +119,18 @@ app.post('/api/generate-trip', async (req, res) => {
 
     if (!user_id) return res.status(401).json({ error: "로그인이 필요합니다." });
 
-    // 시간 유효성 검사 (3시간 미만 차단)
     const startDateTime = new Date(`${startDate}T${arrivalTime}`);
     const endDateTime = new Date(`${endDate}T${departureTime}`);
     if ((endDateTime - startDateTime) / (1000 * 60 * 60) < 3) {
         return res.status(400).json({ error: "체류 시간이 너무 짧습니다. (최소 3시간)" });
     }
 
-    // 유저 제한 확인
     let { data: userLimit } = await supabase.from('user_limits').select('*').eq('user_id', user_id).single();
     if (!userLimit) {
        const { data: newLimit } = await supabase.from('user_limits').insert([{ user_id, tier: 'free', usage_count: 0 }]).select().single(); 
        userLimit = newLimit; 
     }
     
-    // 월별 초기화
     const today = new Date();
     const lastReset = new Date(userLimit.last_reset_date);
     if (today.getMonth() !== lastReset.getMonth() || today.getFullYear() !== lastReset.getFullYear()) {
@@ -140,11 +139,9 @@ app.post('/api/generate-trip', async (req, res) => {
     }
 
     const limit = TIER_LIMITS[userLimit.tier] || 3;
-    // 한도 체크는 프론트엔드 광고 로직으로 위임
 
     const totalDays = calculateDays(startDate, endDate);
 
-    // 시간 제약 프롬프트
     let timeConstraint = "";
     if (totalDays === 1) {
         timeConstraint = `**[🚨 당일치기 필수]** 일정은 **${arrivalTime} 시작**, **${departureTime} 종료**. 범위 밖 일정 생성 금지.`;
@@ -175,9 +172,7 @@ app.post('/api/generate-trip', async (req, res) => {
 
     const itineraryJson = cleanAndParseJSON(result.response.text());
 
-    // 병렬 처리 & 데이터 보정
     await Promise.all(itineraryJson.itinerary.map(async (dayPlan) => {
-      // 중복 제거
       const uniqueActivities = [];
       const seenPlaces = new Set();
       dayPlan.activities.forEach(act => {
@@ -195,7 +190,6 @@ app.post('/api/generate-trip', async (req, res) => {
       const enrichedActivities = await Promise.all(dayPlan.activities.map(async (activity) => {
         if (activity.place_name.includes("이동") && !activity.place_name.includes("숙소")) return null; 
 
-        // destination을 전달하여 해당 지역 내에서 검색
         const details = await fetchPlaceDetails(activity.place_name, destination);
         
         let finalBookingUrl = null;
@@ -242,7 +236,6 @@ app.post('/api/generate-trip', async (req, res) => {
 
 // --- [API 2] 일정 수정 (Modify) ---
 app.post('/api/modify-trip', async (req, res) => {
-  console.log("Modify Trip Request Received");
   try {
     const { trip_id, currentItinerary, userRequest, destination, user_id } = req.body;
 
@@ -263,7 +256,6 @@ app.post('/api/modify-trip', async (req, res) => {
       }))
     };
 
-    // 캐싱 (재사용)
     const existingPlacesMap = new Map();
     currentItinerary.itinerary.forEach(day => {
         day.activities.forEach(act => {
@@ -316,12 +308,9 @@ app.post('/api/modify-trip', async (req, res) => {
             return { ...cached, ...activity };
         }
 
-        // destination 전달하여 검색 범위 고정
         const details = await fetchPlaceDetails(activity.place_name, destination);
-        
         let finalBookingUrl = null;
         const isPark = details.types && (details.types.includes('park') || details.types.includes('natural_feature'));
-        
         if (!isPark && activity.is_booking_required) {
           if (details.websiteUri) finalBookingUrl = details.websiteUri;
           else if (details.googleMapsUri) finalBookingUrl = details.googleMapsUri;
@@ -344,7 +333,6 @@ app.post('/api/modify-trip', async (req, res) => {
       }
     }));
 
-    // DB 업데이트
     if (trip_id) {
         await supabase.from('trip_plans').update({ itinerary_data: modifiedJson }).eq('id', trip_id).eq('user_id', user_id);
     }
@@ -357,7 +345,7 @@ app.post('/api/modify-trip', async (req, res) => {
   }
 });
 
-// --- [API 3] 자동완성 (Places API New + 필터링) ---
+// --- [API 3] 자동완성 ---
 app.get('/api/places/autocomplete', async (req, res) => {
   const { query } = req.query;
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
@@ -370,7 +358,6 @@ app.get('/api/places/autocomplete', async (req, res) => {
       {
         input: query,
         languageCode: "ko",
-        // 도시/지역만 검색되도록 필터링
         includedPrimaryTypes: ["locality", "administrative_area_level_1", "administrative_area_level_2"]
       },
       {
@@ -397,21 +384,28 @@ app.get('/api/places/autocomplete', async (req, res) => {
 
 // --- [API 4] 회원 탈퇴 ---
 app.delete('/api/auth/delete', async (req, res) => {
-  const { user_id } = req.body;
+  const { user_id, email } = req.body;
   if (!user_id) return res.status(400).json({ error: "User ID Required" });
 
   try {
+    if (email) {
+      await supabase.from('deleted_users').insert([{ email: email }]);
+    }
     await supabase.from('trip_plans').delete().eq('user_id', user_id);
     await supabase.from('user_limits').delete().eq('user_id', user_id);
     await supabase.from('suggestions').delete().eq('user_id', user_id);
+
+    const { error: deleteError } = await supabaseAdmin.auth.admin.deleteUser(user_id);
+    if (deleteError) throw deleteError;
+
     res.status(200).json({ success: true, message: "회원 탈퇴 완료" });
   } catch (error) {
     res.status(500).json({ error: "탈퇴 처리 중 오류" });
   }
 });
 
-// --- [API 5] 건의사항 게시판 (✨수정됨) ---
-// 1. 목록 조회
+// --- [API 5] 건의사항 게시판 (✨ 수정됨) ---
+// 1. 조회: 모든 글 반환 (user_id 포함)
 app.get('/api/board', async (req, res) => {
   try {
     const { data, error } = await supabase.from('suggestions').select('*').order('created_at', { ascending: false });
@@ -422,16 +416,17 @@ app.get('/api/board', async (req, res) => {
   }
 });
 
-// 2. 글 작성 (로그인 필수)
+// 2. 작성: 익명 허용 (user_id 없어도 됨)
 app.post('/api/board', async (req, res) => {
   const { user_id, email, content } = req.body;
-  
-  // ✨ [수정] 로그인한 사용자만 작성 가능
-  if (!user_id) return res.status(401).json({ error: "로그인이 필요합니다." });
-  if (!content) return res.status(400).json({ error: "내용을 입력해주세요." });
+  if (!content) return res.status(400).json({ error: "내용 부족" });
 
   try {
-    const { data, error } = await supabase.from('suggestions').insert([{ user_id, email, content }]).select();
+    const { data, error } = await supabase.from('suggestions').insert([{ 
+        user_id: user_id || null, 
+        email: email || '익명', 
+        content 
+    }]).select();
     if (error) throw error;
     res.status(200).json({ success: true, data });
   } catch (error) {
@@ -439,23 +434,24 @@ app.post('/api/board', async (req, res) => {
   }
 });
 
-// 3. 글 삭제 (본인만 가능)
+// 3. 삭제: 관리자(ADMIN_EMAIL) 또는 작성자 본인만 가능
 app.delete('/api/board/:id', async (req, res) => {
   const { id } = req.params;
-  const { user_id } = req.body; // 요청자 ID
+  const { user_id, email } = req.body; // 요청자 정보
   
-  if (!user_id) return res.status(401).json({ error: "로그인이 필요합니다." });
-
   try {
-    // ✨ [수정] user_id가 일치하는지 확인하여 본인 글만 삭제
-    const { error } = await supabase
-      .from('suggestions')
-      .delete()
-      .eq('id', id)
-      .eq('user_id', user_id);
+    let query = supabase.from('suggestions').delete().eq('id', id);
 
+    // 관리자가 아니면 -> 본인 글인지 확인 (user_id 일치 조건 추가)
+    if (email !== ADMIN_EMAIL) {
+        if (!user_id) return res.status(403).json({ error: "권한이 없습니다." });
+        query = query.eq('user_id', user_id);
+    }
+    // 관리자면 -> 조건 없이 삭제 (모두 삭제 가능)
+
+    const { error } = await query;
     if (error) throw error;
-    res.status(200).json({ success: true, message: "삭제되었습니다." });
+    res.status(200).json({ success: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
