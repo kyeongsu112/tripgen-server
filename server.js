@@ -21,7 +21,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 // 2. 관리자 클라이언트 (회원 삭제 및 관리자 권한 작업용 - Service Role Key 필수)
 const supabaseAdmin = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY);
 
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" }); 
+const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); 
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 // 관리자 이메일 (환경변수에서 가져오거나 기본값 설정)
 const ADMIN_EMAIL = process.env.NEXT_PUBLIC_ADMIN_EMAIL;
