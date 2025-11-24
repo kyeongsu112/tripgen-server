@@ -29,17 +29,17 @@ function calculateDays(start, end) {
   return Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
 }
 
+// JSON 파싱 헬퍼
 function cleanAndParseJSON(text) {
   try {
     const cleaned = text.replace(/```json/g, "").replace(/```/g, "").trim();
     return JSON.parse(cleaned);
   } catch (e) {
-    console.error("JSON Parse Fail:", text.substring(0, 500));
+    console.error("JSON Parse Fail. Raw Text Start:", text.substring(0, 500));
     throw new Error("AI 응답 형식이 올바르지 않습니다.");
   }
 }
 
-// 장소 상세 정보 조회 (지역 이탈 방지 로직 포함)
 async function fetchPlaceDetails(placeName, cityContext = "") {
   if (placeName.includes("체크인") || placeName.includes("숙소") || placeName.includes("복귀")) {
      return { place_name: placeName, type: "숙소" };
@@ -139,6 +139,9 @@ app.post('/api/generate-trip', async (req, res) => {
       await supabase.from('user_limits').update({ usage_count: 0, last_reset_date: new Date() }).eq('user_id', user_id);
     }
 
+    const limit = TIER_LIMITS[userLimit.tier] || 3;
+    // 한도 체크는 프론트엔드 광고 로직으로 위임
+
     const totalDays = calculateDays(startDate, endDate);
 
     // 시간 제약 프롬프트
@@ -237,9 +240,8 @@ app.post('/api/generate-trip', async (req, res) => {
   }
 });
 
-// --- [API 2] 일정 수정 (Modify) ---
+// --- [API 2] 일정 수정 (Modify - DB 저장 포함) ---
 app.post('/api/modify-trip', async (req, res) => {
-  console.log("Modify Trip Request Received");
   try {
     const { trip_id, currentItinerary, userRequest, destination, user_id } = req.body;
 
@@ -313,6 +315,7 @@ app.post('/api/modify-trip', async (req, res) => {
             return { ...cached, ...activity };
         }
 
+        // destination 전달하여 검색 범위 고정
         const details = await fetchPlaceDetails(activity.place_name, destination);
         
         let finalBookingUrl = null;
@@ -353,7 +356,7 @@ app.post('/api/modify-trip', async (req, res) => {
   }
 });
 
-// --- [API 3] 자동완성 (Places API New + 필터링) ---
+// --- [API 3] 자동완성 (New API + 도시 필터링) ---
 app.get('/api/places/autocomplete', async (req, res) => {
   const { query } = req.query;
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
@@ -366,7 +369,7 @@ app.get('/api/places/autocomplete', async (req, res) => {
       {
         input: query,
         languageCode: "ko",
-        // ✨ 도시/지역만 검색되도록 필터링 (야시장, 호텔 제외)
+        // 도시/지역만 검색되도록 필터링 (야시장, 호텔 제외)
         includedPrimaryTypes: ["locality", "administrative_area_level_1", "administrative_area_level_2"]
       },
       {
@@ -386,7 +389,7 @@ app.get('/api/places/autocomplete', async (req, res) => {
     res.status(200).json({ predictions });
 
   } catch (error) {
-    console.error("Autocomplete Error:", error.message);
+    console.error("Autocomplete Error:", error.response?.data || error.message);
     res.status(200).json({ predictions: [] });
   }
 });
@@ -416,7 +419,6 @@ app.get('/api/board', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
-
 app.post('/api/board', async (req, res) => {
   const { user_id, email, content } = req.body;
   if (!user_id || !content) return res.status(400).json({ error: "내용 부족" });
@@ -429,7 +431,6 @@ app.post('/api/board', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
-
 app.delete('/api/board/:id', async (req, res) => {
   const { id } = req.params;
   const { user_id } = req.body;
@@ -442,7 +443,7 @@ app.delete('/api/board/:id', async (req, res) => {
   }
 });
 
-// --- 기타 조회 API ---
+// --- 기타 API ---
 app.get('/api/my-trips', async (req, res) => {
   const { user_id } = req.query;
   if (!user_id) return res.status(400).json({ error: "로그인이 필요합니다." });
