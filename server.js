@@ -37,12 +37,10 @@ function cleanAndParseJSON(text) {
   }
 }
 
-// 장소 상세 정보 (Places API New)
 async function fetchPlaceDetails(placeName) {
   if (placeName.includes("체크인") || placeName.includes("숙소") || placeName.includes("복귀")) {
      return { place_name: placeName, type: "숙소" };
   }
-
   try {
     const response = await axios.post(
       `https://places.googleapis.com/v1/places:searchText`,
@@ -55,7 +53,6 @@ async function fetchPlaceDetails(placeName) {
         }
       }
     );
-    
     const place = response.data.places && response.data.places[0];
     if (!place) return { place_name: placeName }; 
 
@@ -64,7 +61,6 @@ async function fetchPlaceDetails(placeName) {
       const photoReference = place.photos[0].name;
       photoUrl = `https://places.googleapis.com/v1/${photoReference}/media?key=${GOOGLE_MAPS_API_KEY}&maxHeightPx=400&maxWidthPx=400`;
     }
-
     return {
       place_id: place.id,
       place_name: place.displayName?.text || placeName,
@@ -77,7 +73,6 @@ async function fetchPlaceDetails(placeName) {
       types: place.types || [] 
     };
   } catch (error) {
-    console.error(`⚠️ 검색 실패: ${placeName}`);
     return { place_name: placeName };
   }
 }
@@ -99,20 +94,18 @@ async function calculateRoute(originId, destId) {
 
 // --- [API 1] 여행 일정 생성 ---
 app.post('/api/generate-trip', async (req, res) => {
-  console.log("Generate Request");
+  console.log("Generate Trip Request Received");
   try {
     const { destination, startDate, endDate, arrivalTime, departureTime, otherRequirements, user_id } = req.body;
 
     if (!user_id) return res.status(401).json({ error: "로그인이 필요합니다." });
 
-    // 유저 제한 확인
     let { data: userLimit } = await supabase.from('user_limits').select('*').eq('user_id', user_id).single();
     if (!userLimit) {
        const { data: newLimit } = await supabase.from('user_limits').insert([{ user_id, tier: 'free', usage_count: 0 }]).select().single(); 
        userLimit = newLimit; 
     }
     
-    // 월별 초기화
     const today = new Date();
     const lastReset = new Date(userLimit.last_reset_date);
     if (today.getMonth() !== lastReset.getMonth() || today.getFullYear() !== lastReset.getFullYear()) {
@@ -131,28 +124,30 @@ app.post('/api/generate-trip', async (req, res) => {
       여행지: ${destination}
       기간: ${startDate} ~ ${endDate} (총 ${totalDays}일)
       시간: ${arrivalTime} 시작, ${departureTime} 종료.
-      ✨ 사용자 요청: "${otherRequirements || "없음"}"
+      ✨ 사용자 요청: "${otherRequirements || "없음"}" (최우선 반영)
 
       [규칙]
-      1. 아침~저녁(22시) 꽉 채운 일정.
-      2. **실존하는 구체적 상호명** 필수.
-      3. 중복 금지.
-      4. 상세 데이터(사진 등) 제외.
+      1. 시간: 아침부터 저녁(20~22시)까지 꽉 채우세요.
+      2. 장소: 반드시 **실존하는 구체적 상호명** 필수.
+      3. 중복: 같은 장소 반복 금지.
+      4. 데이터: photoUrl 등 상세 정보는 적지 마세요.
 
-      [출력 JSON]
+      [출력 형식 - JSON]
       { "trip_title": "제목", "itinerary": [ { "day": 1, "date": "YYYY-MM-DD", "activities": [ { "time": "HH:MM", "place_name": "장소명", "type": "관광/식사/숙소", "activity_description": "설명", "is_booking_required": true/false } ] } ] }
     `;
     
+    console.log("Calling Gemini for Generation...");
     const result = await model.generateContent({
       contents: [{ role: "user", parts: [{ text: prompt }] }],
       generationConfig: { responseMimeType: "application/json" }
     });
 
-    const itineraryJson = cleanAndParseJSON(result.response.text());
+    const text = result.response.text();
+    const itineraryJson = cleanAndParseJSON(text);
 
-    // 병렬 처리
+    console.log("Fetching Details (Parallel)...");
+    
     await Promise.all(itineraryJson.itinerary.map(async (dayPlan) => {
-      // 중복 제거
       const uniqueActivities = [];
       const seenPlaces = new Set();
       dayPlan.activities.forEach(act => {
@@ -206,18 +201,22 @@ app.post('/api/generate-trip', async (req, res) => {
     if (error) throw error;
     await supabase.from('user_limits').update({ usage_count: userLimit.usage_count + 1 }).eq('user_id', user_id);
 
+    console.log("Trip Generated Successfully!");
     res.status(200).json({ success: true, data: data[0] });
 
   } catch (error) {
-    console.error("Generate Error:", error);
+    console.error("🔥 Generate Error:", error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// --- [API 2] 일정 수정 (Modify - 최적화됨) ---
+// --- [API 2] 일정 수정 (Modify) - ✨ DB 저장 추가됨 ---
 app.post('/api/modify-trip', async (req, res) => {
+  console.log("Modify Trip Request Received");
   try {
-    const { currentItinerary, userRequest, destination, user_id } = req.body;
+    // ✨ trip_id 추가됨: 수정한 일정을 DB에 저장하기 위해 필요
+    const { trip_id, currentItinerary, userRequest, destination, user_id } = req.body;
+
     if (!user_id) return res.status(401).json({ error: "권한이 없습니다." });
 
     const simplifiedItinerary = {
@@ -235,7 +234,6 @@ app.post('/api/modify-trip', async (req, res) => {
       }))
     };
 
-    // 기존 장소 캐싱 (재사용)
     const existingPlacesMap = new Map();
     currentItinerary.itinerary.forEach(day => {
         day.activities.forEach(act => {
@@ -261,8 +259,8 @@ app.post('/api/modify-trip', async (req, res) => {
 
     const modifiedJson = cleanAndParseJSON(result.response.text());
 
+    console.log("Verifying Modified Places...");
     await Promise.all(modifiedJson.itinerary.map(async (dayPlan) => {
-      // 중복 제거
       const uniqueActivities = [];
       const seenPlaces = new Set();
       dayPlan.activities.forEach(act => {
@@ -280,14 +278,12 @@ app.post('/api/modify-trip', async (req, res) => {
       const enrichedActivities = await Promise.all(dayPlan.activities.map(async (activity) => {
         if (activity.place_name.includes("이동") && !activity.place_name.includes("숙소")) return null;
 
-        // 캐시된 장소면 바로 사용 (API 호출 X) -> 속도 향상
         if (existingPlacesMap.has(activity.place_name)) {
             const cached = existingPlacesMap.get(activity.place_name);
             return { ...cached, ...activity };
         }
 
         const details = await fetchPlaceDetails(activity.place_name);
-        
         let finalBookingUrl = null;
         const isPark = details.types && (details.types.includes('park') || details.types.includes('natural_feature'));
         
@@ -313,6 +309,22 @@ app.post('/api/modify-trip', async (req, res) => {
       }
     }));
 
+    // ✨ [핵심 추가] 수정된 일정을 DB에 업데이트 (저장)
+    if (trip_id) {
+        const { error } = await supabase
+            .from('trip_plans')
+            .update({ itinerary_data: modifiedJson })
+            .eq('id', trip_id)
+            .eq('user_id', user_id); // 보안: 본인 것만 수정 가능
+
+        if (error) {
+            console.error("DB Update Failed:", error);
+            // 에러가 나도 클라이언트에는 결과를 보여주긴 함 (경고 로그)
+        } else {
+            console.log("DB Updated Successfully!");
+        }
+    }
+
     res.status(200).json({ success: true, data: modifiedJson });
 
   } catch (error) {
@@ -321,7 +333,7 @@ app.post('/api/modify-trip', async (req, res) => {
   }
 });
 
-// --- [API 3] 자동완성 (Places API New + 도시/지역 필터) ✨ ---
+// --- [API 3] 자동완성 ---
 app.get('/api/places/autocomplete', async (req, res) => {
   const { query } = req.query;
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
@@ -329,13 +341,11 @@ app.get('/api/places/autocomplete', async (req, res) => {
   if (!query) return res.status(200).json({ predictions: [] });
 
   try {
-    // ✅ Places API (New) 사용
     const response = await axios.post(
       `https://places.googleapis.com/v1/places:autocomplete`,
       {
         input: query,
         languageCode: "ko",
-        // ✨ [핵심] '도시(locality)'와 '행정구역'만 검색하여 잡다한 장소 제외
         includedPrimaryTypes: ["locality", "administrative_area_level_1", "administrative_area_level_2"]
       },
       {
@@ -348,8 +358,8 @@ app.get('/api/places/autocomplete', async (req, res) => {
     
     const suggestions = response.data.suggestions || [];
     const predictions = suggestions.map(item => ({
-      description: item.placePrediction.text.text, // 장소명
-      place_id: item.placePrediction.placeId       // 장소 ID
+      description: item.placePrediction.text.text, 
+      place_id: item.placePrediction.placeId 
     }));
 
     res.status(200).json({ predictions });
