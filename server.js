@@ -240,8 +240,9 @@ app.post('/api/generate-trip', async (req, res) => {
   }
 });
 
-// --- [API 2] 일정 수정 (Modify - DB 저장 포함) ---
+// --- [API 2] 일정 수정 (Modify) ---
 app.post('/api/modify-trip', async (req, res) => {
+  console.log("Modify Trip Request Received");
   try {
     const { trip_id, currentItinerary, userRequest, destination, user_id } = req.body;
 
@@ -356,7 +357,7 @@ app.post('/api/modify-trip', async (req, res) => {
   }
 });
 
-// --- [API 3] 자동완성 (New API + 도시 필터링) ---
+// --- [API 3] 자동완성 (Places API New + 필터링) ---
 app.get('/api/places/autocomplete', async (req, res) => {
   const { query } = req.query;
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
@@ -369,7 +370,7 @@ app.get('/api/places/autocomplete', async (req, res) => {
       {
         input: query,
         languageCode: "ko",
-        // 도시/지역만 검색되도록 필터링 (야시장, 호텔 제외)
+        // 도시/지역만 검색되도록 필터링
         includedPrimaryTypes: ["locality", "administrative_area_level_1", "administrative_area_level_2"]
       },
       {
@@ -402,14 +403,15 @@ app.delete('/api/auth/delete', async (req, res) => {
   try {
     await supabase.from('trip_plans').delete().eq('user_id', user_id);
     await supabase.from('user_limits').delete().eq('user_id', user_id);
-    await supabase.from('suggestions').delete().eq('user_id', user_id); // 게시글도 삭제
+    await supabase.from('suggestions').delete().eq('user_id', user_id);
     res.status(200).json({ success: true, message: "회원 탈퇴 완료" });
   } catch (error) {
     res.status(500).json({ error: "탈퇴 처리 중 오류" });
   }
 });
 
-// --- [API 5] 건의사항 게시판 ---
+// --- [API 5] 건의사항 게시판 (✨수정됨) ---
+// 1. 목록 조회
 app.get('/api/board', async (req, res) => {
   try {
     const { data, error } = await supabase.from('suggestions').select('*').order('created_at', { ascending: false });
@@ -419,9 +421,14 @@ app.get('/api/board', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// 2. 글 작성 (로그인 필수)
 app.post('/api/board', async (req, res) => {
   const { user_id, email, content } = req.body;
-  if (!user_id || !content) return res.status(400).json({ error: "내용 부족" });
+  
+  // ✨ [수정] 로그인한 사용자만 작성 가능
+  if (!user_id) return res.status(401).json({ error: "로그인이 필요합니다." });
+  if (!content) return res.status(400).json({ error: "내용을 입력해주세요." });
 
   try {
     const { data, error } = await supabase.from('suggestions').insert([{ user_id, email, content }]).select();
@@ -431,13 +438,24 @@ app.post('/api/board', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// 3. 글 삭제 (본인만 가능)
 app.delete('/api/board/:id', async (req, res) => {
   const { id } = req.params;
-  const { user_id } = req.body;
+  const { user_id } = req.body; // 요청자 ID
+  
+  if (!user_id) return res.status(401).json({ error: "로그인이 필요합니다." });
+
   try {
-    const { error } = await supabase.from('suggestions').delete().eq('id', id).eq('user_id', user_id);
+    // ✨ [수정] user_id가 일치하는지 확인하여 본인 글만 삭제
+    const { error } = await supabase
+      .from('suggestions')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', user_id);
+
     if (error) throw error;
-    res.status(200).json({ success: true });
+    res.status(200).json({ success: true, message: "삭제되었습니다." });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
