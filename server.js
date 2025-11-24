@@ -29,7 +29,7 @@ function calculateDays(start, end) {
   return Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
 }
 
-// JSON 파싱 헬퍼
+// JSON 파싱 헬퍼 (안전장치)
 function cleanAndParseJSON(text) {
   try {
     const cleaned = text.replace(/```json/g, "").replace(/```/g, "").trim();
@@ -40,15 +40,19 @@ function cleanAndParseJSON(text) {
   }
 }
 
-async function fetchPlaceDetails(placeName) {
+// ✨ [핵심 수정] 장소 검색 시 '도시 이름(cityContext)'을 붙여서 검색 (지역 이탈 방지)
+async function fetchPlaceDetails(placeName, cityContext = "") {
   if (placeName.includes("체크인") || placeName.includes("숙소") || placeName.includes("복귀")) {
      return { place_name: placeName, type: "숙소" };
   }
 
   try {
+    // 예: "오사카" + "스타벅스" -> "오사카 스타벅스" 로 검색하여 엉뚱한 지역 방지
+    const query = cityContext ? `${cityContext} ${placeName}` : placeName;
+
     const response = await axios.post(
       `https://places.googleapis.com/v1/places:searchText`,
-      { textQuery: placeName, languageCode: "ko" },
+      { textQuery: query, languageCode: "ko" },
       {
         headers: {
           "Content-Type": "application/json",
@@ -69,7 +73,7 @@ async function fetchPlaceDetails(placeName) {
 
     return {
       place_id: place.id,
-      place_name: place.displayName?.text || placeName,
+      place_name: place.displayName?.text || placeName, // 구글 정식 명칭 사용
       rating: place.rating || "정보 없음",
       ratingCount: place.userRatingCount || 0,
       googleMapsUri: place.googleMapsUri || "#",
@@ -84,28 +88,42 @@ async function fetchPlaceDetails(placeName) {
   }
 }
 
+// ✨ [경로 계산 강화] 대중교통 -> 운전 -> 도보 순차 시도
 async function calculateRoute(originId, destId) {
   if (!originId || !destId) return null;
-  try {
-    const url = `https://maps.googleapis.com/maps/api/directions/json?origin=place_id:${originId}&destination=place_id:${destId}&mode=transit&language=ko&key=${GOOGLE_MAPS_API_KEY}`;
-    const response = await axios.get(url);
-    if (response.data.status === 'OK' && response.data.routes.length > 0) {
-      const leg = response.data.routes[0].legs[0];
-      return { duration: leg.duration.text, distance: leg.distance.text };
-    }
-    return null;
-  } catch (error) {
-    return null;
+  const modes = ['transit', 'driving', 'walking'];
+
+  for (const mode of modes) {
+    try {
+      const url = `https://maps.googleapis.com/maps/api/directions/json?origin=place_id:${originId}&destination=place_id:${destId}&mode=${mode}&language=ko&key=${GOOGLE_MAPS_API_KEY}`;
+      const response = await axios.get(url);
+      if (response.data.status === 'OK' && response.data.routes.length > 0) {
+        const leg = response.data.routes[0].legs[0];
+        return { 
+            duration: leg.duration.text, 
+            distance: leg.distance.text,
+            mode: mode === 'transit' ? '대중교통' : (mode === 'driving' ? '택시/차량' : '도보')
+        };
+      }
+    } catch (error) { continue; }
   }
+  return null;
 }
 
-// --- [API 1] 여행 일정 생성 ---
+// --- [API 1] 여행 일정 생성 (Generate) ---
 app.post('/api/generate-trip', async (req, res) => {
-  console.log("Generate Request");
+  console.log("Generate Trip Request Received");
   try {
     const { destination, startDate, endDate, arrivalTime, departureTime, otherRequirements, user_id } = req.body;
 
     if (!user_id) return res.status(401).json({ error: "로그인이 필요합니다." });
+
+    // 시간 유효성 검사 (3시간 미만 차단)
+    const startDateTime = new Date(`${startDate}T${arrivalTime}`);
+    const endDateTime = new Date(`${endDate}T${departureTime}`);
+    if ((endDateTime - startDateTime) / (1000 * 60 * 60) < 3) {
+        return res.status(400).json({ error: "체류 시간이 너무 짧습니다. (최소 3시간)" });
+    }
 
     // 유저 제한 확인
     let { data: userLimit } = await supabase.from('user_limits').select('*').eq('user_id', user_id).single();
@@ -121,19 +139,14 @@ app.post('/api/generate-trip', async (req, res) => {
       await supabase.from('user_limits').update({ usage_count: 0, last_reset_date: new Date() }).eq('user_id', user_id);
     }
 
-    const limit = TIER_LIMITS[userLimit.tier] || 3;
-    if (userLimit.tier !== 'admin' && userLimit.usage_count >= limit) {
-        return res.status(403).json({ error: `이번 달 생성 한도(${limit}회)를 모두 사용하셨습니다.` });
-    }
-
     const totalDays = calculateDays(startDate, endDate);
 
-    // ✨ [핵심] 당일치기 시간 제약 처리
+    // 시간 제약 프롬프트
     let timeConstraint = "";
     if (totalDays === 1) {
-        timeConstraint = `**[🚨 당일치기 필수 규칙]**\n1. 일정은 반드시 **${arrivalTime}에 시작**해서 **${departureTime}에 종료**되어야 합니다.\n2. ${arrivalTime} 이전이나 ${departureTime} 이후의 일정은 생성하지 마세요.`;
+        timeConstraint = `**[🚨 당일치기 필수]** 일정은 **${arrivalTime} 시작**, **${departureTime} 종료**. 범위 밖 일정 생성 금지.`;
     } else {
-        timeConstraint = `**[시간 규칙]**\n1. Day 1: ${arrivalTime} 이후 시작.\n2. Day ${totalDays}: ${departureTime} 이전 종료.\n3. 나머지 날: 아침부터 저녁(22시)까지 꽉 채움.`;
+        timeConstraint = `**[시간 규칙]** Day 1: ${arrivalTime} 이후 시작. Day ${totalDays}: ${departureTime} 이전 종료. 나머지: 09:00~22:00 꽉 채움.`;
     }
 
     const prompt = `
@@ -142,10 +155,11 @@ app.post('/api/generate-trip', async (req, res) => {
       ${timeConstraint}
       ✨ 사용자 요청: "${otherRequirements || "없음"}" (최우선 반영)
 
-      [일정 생성 규칙]
-      1. **장소:** '맛집' 같은 추상적 표현 금지. 반드시 **실존하는 구체적 상호명** 기입.
-      2. **중복:** 같은 장소 반복 금지.
-      3. **데이터:** photoUrl 등 상세 정보 필드는 비워두세요.
+      [규칙]
+      1. **지역 고정:** 모든 장소는 반드시 **${destination}** 내에 있어야 합니다.
+      2. **장소:** 구체적 상호명 필수 (예: '맛집' X -> '명동교자' O).
+      3. **중복:** 같은 장소 반복 금지.
+      4. **데이터:** photoUrl 등 상세 정보 제외.
 
       [출력 JSON]
       { "trip_title": "제목", "itinerary": [ { "day": 1, "date": "YYYY-MM-DD", "activities": [ { "time": "HH:MM", "place_name": "장소명", "type": "관광/식사/숙소", "activity_description": "설명", "is_booking_required": true/false } ] } ] }
@@ -158,7 +172,7 @@ app.post('/api/generate-trip', async (req, res) => {
 
     const itineraryJson = cleanAndParseJSON(result.response.text());
 
-    // 병렬 처리
+    // 병렬 처리 & 데이터 보정
     await Promise.all(itineraryJson.itinerary.map(async (dayPlan) => {
       // 중복 제거
       const uniqueActivities = [];
@@ -178,7 +192,8 @@ app.post('/api/generate-trip', async (req, res) => {
       const enrichedActivities = await Promise.all(dayPlan.activities.map(async (activity) => {
         if (activity.place_name.includes("이동") && !activity.place_name.includes("숙소")) return null; 
 
-        const details = await fetchPlaceDetails(activity.place_name);
+        // ✨ destination을 전달하여 해당 지역 내에서 검색
+        const details = await fetchPlaceDetails(activity.place_name, destination);
         
         let finalBookingUrl = null;
         const isPark = details.types && (details.types.includes('park') || details.types.includes('natural_feature'));
@@ -222,7 +237,7 @@ app.post('/api/generate-trip', async (req, res) => {
   }
 });
 
-// --- [API 2] 일정 수정 (Modify - DB 저장 포함) ---
+// --- [API 2] 일정 수정 (Modify - 지역 고정 & DB 저장) ---
 app.post('/api/modify-trip', async (req, res) => {
   try {
     const { trip_id, currentItinerary, userRequest, destination, user_id } = req.body;
@@ -244,6 +259,7 @@ app.post('/api/modify-trip', async (req, res) => {
       }))
     };
 
+    // 캐싱된 장소 정보
     const existingPlacesMap = new Map();
     currentItinerary.itinerary.forEach(day => {
         day.activities.forEach(act => {
@@ -255,10 +271,15 @@ app.post('/api/modify-trip', async (req, res) => {
 
     const prompt = `
       여행 전문가로서 일정을 수정해주세요.
-      [여행지]: ${destination}
+      [여행지]: **${destination}** (변경 금지)
       [기존]: ${JSON.stringify(simplifiedItinerary)}
       ✨ [수정 요청]: "${userRequest}"
-      [규칙] 시간 준수, 중복 금지, 구체적 상호명.
+      
+      [규칙]
+      1. **지역 고정:** ${destination} 이외의 장소 추천 금지.
+      2. 시간: 저녁까지 꽉 채움.
+      3. 중복 금지, 구체적 상호명.
+
       [출력] JSON Only.
     `;
 
@@ -287,13 +308,13 @@ app.post('/api/modify-trip', async (req, res) => {
       const enrichedActivities = await Promise.all(dayPlan.activities.map(async (activity) => {
         if (activity.place_name.includes("이동") && !activity.place_name.includes("숙소")) return null;
 
-        // 기존 정보 재사용 (속도 향상)
         if (existingPlacesMap.has(activity.place_name)) {
             const cached = existingPlacesMap.get(activity.place_name);
             return { ...cached, ...activity };
         }
 
-        const details = await fetchPlaceDetails(activity.place_name);
+        // ✨ destination 전달하여 검색 범위 고정
+        const details = await fetchPlaceDetails(activity.place_name, destination);
         
         let finalBookingUrl = null;
         const isPark = details.types && (details.types.includes('park') || details.types.includes('natural_feature'));
@@ -320,7 +341,7 @@ app.post('/api/modify-trip', async (req, res) => {
       }
     }));
 
-    // ✨ DB 업데이트 (저장)
+    // DB 업데이트
     if (trip_id) {
         await supabase.from('trip_plans').update({ itinerary_data: modifiedJson }).eq('id', trip_id).eq('user_id', user_id);
     }
@@ -333,7 +354,7 @@ app.post('/api/modify-trip', async (req, res) => {
   }
 });
 
-// --- [API 3] 자동완성 (Places API New) ---
+// --- [API 3] 자동완성 (Legacy API + City Filter) ---
 app.get('/api/places/autocomplete', async (req, res) => {
   const { query } = req.query;
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
@@ -341,33 +362,39 @@ app.get('/api/places/autocomplete', async (req, res) => {
   if (!query) return res.status(200).json({ predictions: [] });
 
   try {
-    const response = await axios.post(
-      `https://places.googleapis.com/v1/places:autocomplete`,
+    const response = await axios.get(
+      `https://maps.googleapis.com/maps/api/place/autocomplete/json`,
       {
-        input: query,
-        languageCode: "ko",
-        // ✨ 도시/지역만 검색되도록 필터링
-        includedPrimaryTypes: ["locality", "administrative_area_level_1", "administrative_area_level_2"]
-      },
-      {
-        headers: {
-          "Content-Type": "application/json",
-          "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY
+        params: {
+          input: query,
+          language: 'ko',
+          types: '(cities)', // 도시 단위만 검색 (호이안 야시장 등 제외)
+          key: GOOGLE_MAPS_API_KEY
         }
       }
     );
     
-    const suggestions = response.data.suggestions || [];
-    const predictions = suggestions.map(item => ({
-      description: item.placePrediction.text.text, 
-      place_id: item.placePrediction.placeId 
-    }));
-
-    res.status(200).json({ predictions });
-
+    if (response.data.status === 'OK') {
+      res.status(200).json({ predictions: response.data.predictions });
+    } else {
+      res.status(200).json({ predictions: [] });
+    }
   } catch (error) {
-    console.error("Autocomplete Error:", error.response?.data || error.message);
     res.status(200).json({ predictions: [] });
+  }
+});
+
+// --- [API 4] 회원 탈퇴 ---
+app.delete('/api/auth/delete', async (req, res) => {
+  const { user_id } = req.body;
+  if (!user_id) return res.status(400).json({ error: "User ID Required" });
+
+  try {
+    await supabase.from('trip_plans').delete().eq('user_id', user_id);
+    await supabase.from('user_limits').delete().eq('user_id', user_id);
+    res.status(200).json({ success: true, message: "회원 탈퇴 완료" });
+  } catch (error) {
+    res.status(500).json({ error: "탈퇴 처리 중 오류" });
   }
 });
 
