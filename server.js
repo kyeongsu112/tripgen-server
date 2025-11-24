@@ -16,8 +16,9 @@ app.use(express.json({ limit: '10mb' }));
 // --- [설정 확인 및 초기화] ---
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// 1. 일반 클라이언트 (조회 및 본인 데이터 수정용)
+// 1. 일반 클라이언트 (조회 및 본인 데이터 수정용 - RLS 적용됨)
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+
 // 2. 관리자 클라이언트 (회원 삭제 및 관리자 권한 작업용 - Service Role Key 필수)
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL, 
@@ -26,7 +27,7 @@ const supabaseAdmin = createClient(
 
 const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); 
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
-// 관리자 이메일 (환경변수에서 가져오거나 기본값 설정)
+// 관리자 이메일
 const ADMIN_EMAIL = process.env.NEXT_PUBLIC_ADMIN_EMAIL;
 
 const TIER_LIMITS = { free: 3, pro: 30, admin: Infinity };
@@ -149,9 +150,6 @@ app.post('/api/generate-trip', async (req, res) => {
       userLimit.usage_count = 0;
       await supabase.from('user_limits').update({ usage_count: 0, last_reset_date: new Date() }).eq('user_id', user_id);
     }
-
-    // const limit = TIER_LIMITS[userLimit.tier] || 3;
-    // 한도 체크는 프론트엔드 광고 로직으로 위임
 
     const totalDays = calculateDays(startDate, endDate);
 
@@ -408,14 +406,16 @@ app.delete('/api/auth/delete', async (req, res) => {
   if (!user_id) return res.status(400).json({ error: "User ID Required" });
 
   try {
+    // 1. 차단 리스트 등록
     if (email) {
       await supabase.from('deleted_users').insert([{ email: email }]);
     }
+    // 2. 모든 데이터 삭제
     await supabase.from('trip_plans').delete().eq('user_id', user_id);
     await supabase.from('user_limits').delete().eq('user_id', user_id);
     await supabase.from('suggestions').delete().eq('user_id', user_id); // 게시글도 삭제
 
-    // ✨ Supabase Auth 유저 영구 삭제 (Service Key 필요)
+    // 3. ✨ Supabase Auth 유저 영구 삭제 (Service Key 필요)
     const { error: deleteError } = await supabaseAdmin.auth.admin.deleteUser(user_id);
     if (deleteError) throw deleteError;
 
@@ -425,7 +425,7 @@ app.delete('/api/auth/delete', async (req, res) => {
   }
 });
 
-// --- [API 5] 건의사항 게시판 (관리자 삭제 기능 강화) ---
+// --- [API 5] 건의사항 게시판 (익명 허용 & 관리자 삭제) ---
 // 1. 조회
 app.get('/api/board', async (req, res) => {
   try {
@@ -455,25 +455,23 @@ app.post('/api/board', async (req, res) => {
   }
 });
 
-// 3. 삭제 (관리자만 또는 본인만)
+// 3. 삭제 (관리자 강제 삭제 + 본인 삭제)
 app.delete('/api/board/:id', async (req, res) => {
   const { id } = req.params;
-  const { user_id, email } = req.body; // 요청자 정보
+  const { user_id, email } = req.body;
   
   try {
-    let query = supabase.from('suggestions').delete().eq('id', id);
-
-    // 관리자(ADMIN_EMAIL)라면 -> 조건 없이 supabaseAdmin으로 강제 삭제
+    // ✨ 관리자(ADMIN_EMAIL)라면 -> supabaseAdmin으로 강제 삭제 (RLS 무시)
     if (email === ADMIN_EMAIL) {
-         await supabaseAdmin.from('suggestions').delete().eq('id', id);
+         const { error } = await supabaseAdmin.from('suggestions').delete().eq('id', id);
+         if (error) throw error;
          return res.status(200).json({ success: true });
     }
 
-    // 일반 유저라면 -> 본인 글인지 확인 (user_id 일치)
+    // 일반 유저라면 -> 본인 글인지 확인 (RLS 적용됨)
     if (!user_id) return res.status(403).json({ error: "권한이 없습니다." });
-    query = query.eq('user_id', user_id);
+    const { error } = await supabase.from('suggestions').delete().eq('id', id).eq('user_id', user_id);
     
-    const { error } = await query;
     if (error) throw error;
     res.status(200).json({ success: true });
   } catch (error) {
