@@ -56,7 +56,6 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
   }
 
   try {
-    // "도시명 + 장소명"으로 검색하여 다른 지역 검색 방지
     const query = cityContext ? `${cityContext} ${placeName}` : placeName;
 
     const response = await axios.post(
@@ -66,7 +65,7 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
         headers: {
           "Content-Type": "application/json",
           "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
-          "X-Goog-FieldMask": "places.id,places.photos,places.rating,places.userRatingCount,places.googleMapsUri,places.location,places.websiteUri,places.types,places.displayName"
+          "X-Goog-FieldMask": "places.id,places.rating,places.userRatingCount,places.googleMapsUri,places.location,places.websiteUri,places.types,places.displayName"
         }
       }
     );
@@ -75,14 +74,15 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
     if (!place) return { place_name: placeName };
 
     let photoUrl = null;
-    if (place.photos && place.photos.length > 0) {
-      const photoReference = place.photos[0].name;
-      photoUrl = `https://places.googleapis.com/v1/${photoReference}/media?key=${GOOGLE_MAPS_API_KEY}&maxHeightPx=400&maxWidthPx=400`;
-    }
+    // [Billing Optimization] Disable Photo Fetching
+    // if (place.photos && place.photos.length > 0) {
+    //   const photoReference = place.photos[0].name;
+    //   photoUrl = `https://places.googleapis.com/v1/${photoReference}/media?key=${GOOGLE_MAPS_API_KEY}&maxHeightPx=400&maxWidthPx=400`;
+    // }
 
     return {
       place_id: place.id,
-      place_name: place.displayName?.text || placeName, // 구글 정식 명칭 사용
+      place_name: place.displayName?.text || placeName,
       rating: place.rating || "정보 없음",
       ratingCount: place.userRatingCount || 0,
       googleMapsUri: place.googleMapsUri || "#",
@@ -119,6 +119,38 @@ async function calculateRoute(originId, destId) {
   return null;
 }
 
+// 날씨 정보 조회 (Open-Meteo)
+async function fetchDailyWeather(destination, startDate, endDate) {
+  try {
+    // 1. Geocoding
+    const geoRes = await axios.get(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(destination)}&count=1&language=ko&format=json`);
+    if (!geoRes.data.results || geoRes.data.results.length === 0) return null;
+
+    const { latitude, longitude } = geoRes.data.results[0];
+
+    // 2. Weather Forecast
+    const weatherRes = await axios.get(`https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto&start_date=${startDate}&end_date=${endDate}`);
+
+    if (!weatherRes.data.daily) return null;
+
+    const daily = weatherRes.data.daily;
+    const weatherMap = {};
+
+    daily.time.forEach((date, index) => {
+      weatherMap[date] = {
+        code: daily.weather_code[index],
+        max: daily.temperature_2m_max[index],
+        min: daily.temperature_2m_min[index]
+      };
+    });
+
+    return weatherMap;
+  } catch (error) {
+    console.error("Weather Fetch Error:", error.message);
+    return null;
+  }
+}
+
 // --- [API 1] 여행 일정 생성 (Generate) ---
 app.post('/api/generate-trip', async (req, res) => {
   console.log("Generate Trip Request Received");
@@ -149,7 +181,11 @@ app.post('/api/generate-trip', async (req, res) => {
       await supabase.from('user_limits').update({ usage_count: 0, last_reset_date: new Date() }).eq('user_id', user_id);
     }
 
-    // 한도 체크는 프론트엔드 광고 로직으로 위임
+    // [Server-Side Limit Check]
+    const limit = TIER_LIMITS[userLimit.tier] || 3;
+    if (userLimit.tier !== 'admin' && userLimit.usage_count >= limit) {
+      return res.status(403).json({ error: "월간 생성 한도를 초과했습니다. (무료: 3회)" });
+    }
 
     const totalDays = calculateDays(startDate, endDate);
 
@@ -185,6 +221,16 @@ app.post('/api/generate-trip', async (req, res) => {
     });
 
     const itineraryJson = cleanAndParseJSON(result.response.text());
+
+    // [Weather Injection]
+    const weatherMap = await fetchDailyWeather(destination, startDate, endDate);
+    if (weatherMap) {
+      itineraryJson.itinerary.forEach(day => {
+        if (weatherMap[day.date]) {
+          day.weather_info = weatherMap[day.date];
+        }
+      });
+    }
 
     // 병렬 처리 & 데이터 보정
     await Promise.all(itineraryJson.itinerary.map(async (dayPlan) => {
