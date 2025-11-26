@@ -232,6 +232,9 @@ app.post('/api/generate-trip', async (req, res) => {
       });
     }
 
+    // [Optimization] Request-Scoped Cache for Place Details
+    const placeDetailsCache = new Map();
+
     // 병렬 처리 & 데이터 보정
     await Promise.all(itineraryJson.itinerary.map(async (dayPlan) => {
       // 중복 제거
@@ -252,8 +255,15 @@ app.post('/api/generate-trip', async (req, res) => {
       const enrichedActivities = await Promise.all(dayPlan.activities.map(async (activity) => {
         if (activity.place_name.includes("이동") && !activity.place_name.includes("숙소")) return null;
 
-        // destination을 전달하여 해당 지역 내에서 검색
-        const details = await fetchPlaceDetails(activity.place_name, destination);
+        // [Cache Check]
+        let details;
+        if (placeDetailsCache.has(activity.place_name)) {
+          details = await placeDetailsCache.get(activity.place_name);
+        } else {
+          const detailsPromise = fetchPlaceDetails(activity.place_name, destination);
+          placeDetailsCache.set(activity.place_name, detailsPromise);
+          details = await detailsPromise;
+        }
 
         let finalBookingUrl = null;
         const isPark = details.types && (details.types.includes('park') || details.types.includes('natural_feature'));
