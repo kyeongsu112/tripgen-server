@@ -593,26 +593,6 @@ app.get('/api/my-trips', async (req, res) => {
 });
 
 app.delete('/api/trip/:id', async (req, res) => {
-  const { id } = req.params; const { user_id } = req.body;
-  const { error } = await supabase.from('trip_plans').delete().eq('id', id).eq('user_id', user_id);
-  res.status(200).json({ success: true, message: "삭제되었습니다." });
-});
-
-app.get('/api/admin/users', async (req, res) => {
-  const { data, error } = await supabase.from('user_limits').select('*').order('created_at', { ascending: false });
-  res.status(200).json({ success: true, data });
-});
-
-app.put('/api/admin/user/tier', async (req, res) => {
-  const { target_user_id, new_tier } = req.body;
-  const { data, error } = await supabase.from('user_limits').update({ tier: new_tier }).eq('user_id', target_user_id).select();
-  res.status(200).json({ success: true, message: "등급 변경 완료", data });
-});
-
-app.get('/api/public/trip/:id', async (req, res) => {
-  const { id } = req.params;
-  const { data, error } = await supabase.from('trip_plans').select('*').eq('id', id).single();
-  res.status(200).json({ success: true, data });
 });
 
 app.listen(PORT, () => {
