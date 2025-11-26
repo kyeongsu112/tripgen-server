@@ -181,10 +181,18 @@ app.post('/api/generate-trip', async (req, res) => {
       userLimit = resetData || { ...userLimit, usage_count: 0 };
     }
 
-    // [Server-Side Limit Check]
+    // [Server-Side Limit Check with Ad Credits]
     const limit = TIER_LIMITS[userLimit.tier] || 3;
-    if (userLimit.tier !== 'admin' && userLimit.usage_count >= limit) {
-      return res.status(403).json({ error: "월간 생성 한도를 초과했습니다. (무료: 3회)" });
+    const adCredits = userLimit.ad_credits || 0;
+    const totalAllowed = limit + adCredits;
+
+    if (userLimit.tier !== 'admin' && userLimit.usage_count >= totalAllowed) {
+      return res.status(403).json({
+        error: "월간 생성 한도를 초과했습니다.",
+        baseLimit: limit,
+        adCredits: adCredits,
+        canEarnMore: true
+      });
     }
 
     const totalDays = calculateDays(startDate, endDate);
@@ -297,7 +305,13 @@ app.post('/api/generate-trip', async (req, res) => {
     }]).select();
 
     if (error) throw error;
-    await supabase.from('user_limits').update({ usage_count: userLimit.usage_count + 1 }).eq('user_id', user_id);
+
+    // Update usage count and decrement ad_credits if using bonus credits
+    const usedAdCredit = userLimit.usage_count >= limit && adCredits > 0;
+    await supabase.from('user_limits').update({
+      usage_count: userLimit.usage_count + 1,
+      ...(usedAdCredit ? { ad_credits: adCredits - 1 } : {})
+    }).eq('user_id', user_id);
 
     res.status(200).json({ success: true, data: data[0] });
 
@@ -607,6 +621,34 @@ app.put('/api/admin/user/tier', async (req, res) => {
   const { target_user_id, new_tier } = req.body;
   const { data, error } = await supabaseAdmin.from('user_limits').update({ tier: new_tier }).eq('user_id', target_user_id).select();
   res.status(200).json({ success: true, message: "등급 변경 완료", data });
+});
+
+// --- [API 7] 광고 크레딧 획득 ---
+app.post('/api/redeem-ad-credit', async (req, res) => {
+  const { user_id } = req.body;
+  if (!user_id) return res.status(401).json({ error: "로그인 필요" });
+
+  try {
+    const { data: userLimit } = await supabase.from('user_limits').select('*').eq('user_id', user_id).single();
+    if (!userLimit) return res.status(404).json({ error: "사용자 정보를 찾을 수 없습니다." });
+
+    const today = new Date().toISOString().split('T')[0];
+    const lastAdDate = userLimit.last_ad_date ? new Date(userLimit.last_ad_date).toISOString().split('T')[0] : null;
+    let dailyCount = userLimit.daily_ad_count || 0;
+    if (lastAdDate !== today) dailyCount = 0;
+    if (dailyCount >= 3) return res.status(429).json({ error: "오늘의 광고 시청 한도를 초과했습니다. (최대 3회)" });
+
+    await supabase.from('user_limits').update({
+      ad_credits: (userLimit.ad_credits || 0) + 1,
+      daily_ad_count: dailyCount + 1,
+      last_ad_date: new Date()
+    }).eq('user_id', user_id);
+
+    res.status(200).json({ success: true, credits: (userLimit.ad_credits || 0) + 1, dailyRemaining: 2 - dailyCount });
+  } catch (error) {
+    console.error("Redeem Ad Credit Error:", error);
+    res.status(500).json({ error: "크레딧 획득 실패" });
+  }
 });
 
 app.get('/api/public/trip/:id', async (req, res) => {
