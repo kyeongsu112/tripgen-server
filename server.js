@@ -706,8 +706,28 @@ app.post('/api/ad/redeem', async (req, res) => {
 
 app.get('/api/public/trip/:id', async (req, res) => {
   const { id } = req.params;
-  const { data, error } = await supabase.from('trip_plans').select('*').eq('id', id).single();
-  res.status(200).json({ success: true, data });
+
+  try {
+    const { data, error } = await supabase
+      .from('trip_plans')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (error) {
+      console.error('Public trip fetch error:', error);
+      return res.status(404).json({ success: false, error: '일정을 찾을 수 없습니다.' });
+    }
+
+    if (!data) {
+      return res.status(404).json({ success: false, error: '일정을 찾을 수 없습니다.' });
+    }
+
+    res.status(200).json({ success: true, data });
+  } catch (error) {
+    console.error('Public trip error:', error);
+    res.status(500).json({ success: false, error: '서버 오류가 발생했습니다.' });
+  }
 });
 
 // --- [API 7] 내 여행 목록 조회 ---
