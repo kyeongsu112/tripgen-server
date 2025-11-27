@@ -57,19 +57,21 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
 
   try {
     // [1] DB 캐시 먼저 확인
-    // 괄호나 쉼표로 분리하여 모든 부분 문자열에 대해 검색 (예: "금각사(킨카쿠지)" -> "금각사", "킨카쿠지")
+    // 괄호나 쉼표로 분리하여 모든 부분 문자열에 대해 검색
     const searchTerms = placeName.split(/[(),]+/)
       .map(p => p.trim())
-      .filter(p => p.length > 1); // 2글자 이상만 검색 (노이즈 방지)
+      .filter(p => p.length > 1);
 
-    // 원래 전체 이름도 검색 조건에 포함
     searchTerms.push(placeName);
-
-    // 중복 제거
     const uniqueTerms = [...new Set(searchTerms)];
 
-    // OR 쿼리 생성: place_name.ilike.%term1%,place_name.ilike.%term2%...
-    const queryStr = uniqueTerms.map(term => `place_name.ilike.%${term}%`).join(',');
+    // place_name OR search_keywords 검색
+    const queryParts = [];
+    uniqueTerms.forEach(term => {
+      queryParts.push(`place_name.ilike.%${term}%`);
+      queryParts.push(`search_keywords.ilike.%${term}%`); // ✨ 추가된 검색 조건
+    });
+    const queryStr = queryParts.join(',');
 
     const { data: cachedPlaces, error: cacheError } = await supabase
       .from('places_cache')
@@ -105,7 +107,6 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
         headers: {
           "Content-Type": "application/json",
           "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
-          // ✨ photos 필드 추가됨
           "X-Goog-FieldMask": "places.id,places.rating,places.userRatingCount,places.googleMapsUri,places.location,places.websiteUri,places.types,places.displayName,places.photos"
         }
       }
@@ -114,7 +115,7 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
     const place = response.data.places && response.data.places[0];
     if (!place) return { place_name: placeName };
 
-    // [3] 사진 URL 생성 (활성화됨!)
+    // [3] 사진 URL 생성
     let photoUrl = null;
     if (place.photos && place.photos.length > 0) {
       const photoReference = place.photos[0].name;
@@ -133,10 +134,13 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
       types: place.types || []
     };
 
-    // [4] DB에 캐시 저장
+    // [4] DB에 캐시 저장 (search_keywords 포함)
+    const newKeywords = [placeName, placeData.place_name].join('|');
+
     await supabase.from('places_cache').upsert([{
       place_id: placeData.place_id,
       place_name: placeData.place_name,
+      search_keywords: newKeywords, // ✨ 검색 키워드 저장
       rating: typeof placeData.rating === 'number' ? placeData.rating : null,
       rating_count: placeData.ratingCount,
       google_maps_uri: placeData.googleMapsUri,
@@ -146,7 +150,7 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
       types: placeData.types
     }], { onConflict: 'place_id' }).select();
 
-    console.log(`💾 Cached: ${placeData.place_name}`);
+    console.log(`💾 Cached: ${placeData.place_name} (keywords: ${newKeywords})`);
 
     return placeData;
   } catch (error) {
@@ -177,19 +181,63 @@ async function calculateRoute(originId, destId) {
   return null;
 }
 
-// 날씨 정보 조회 (Open-Meteo)
+// 날씨 정보 조회 (Open-Meteo) - 개선된 버전
 async function fetchDailyWeather(destination, startDate, endDate) {
   try {
-    // 1. Geocoding
-    const geoRes = await axios.get(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(destination)}&count=1&language=ko&format=json`);
-    if (!geoRes.data.results || geoRes.data.results.length === 0) return null;
+    console.log(`🌤️ Weather Fetch Started: ${destination} (${startDate} ~ ${endDate})`);
 
-    const { latitude, longitude } = geoRes.data.results[0];
+    // 1. Geocoding (한글 시도)
+    let geoRes = await axios.get(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(destination)}&count=1&language=ko&format=json`);
+
+    // 한글로 검색 실패 시, 영어로 재시도
+    if (!geoRes.data.results || geoRes.data.results.length === 0) {
+      console.log(`⚠️ Geocoding failed with Korean name, trying English...`);
+
+      // 간단한 한영 변환 시도 (주요 도시만)
+      const cityNameMap = {
+        '교토': 'Kyoto',
+        '오사카': 'Osaka',
+        '도쿄': 'Tokyo',
+        '후쿠오카': 'Fukuoka',
+        '삿포로': 'Sapporo',
+        '나고야': 'Nagoya',
+        '요코하마': 'Yokohama',
+        '서울': 'Seoul',
+        '부산': 'Busan',
+        '제주': 'Jeju',
+        '파리': 'Paris',
+        '런던': 'London',
+        '뉴욕': 'New York',
+        '로마': 'Rome',
+        '바르셀로나': 'Barcelona',
+        '방콕': 'Bangkok',
+        '홍콩': 'Hong Kong',
+        '싱가포르': 'Singapore',
+        '두바이': 'Dubai',
+        '시드니': 'Sydney'
+      };
+
+      const englishName = cityNameMap[destination] || destination;
+      console.log(`🔄 Retrying with: ${englishName}`);
+
+      geoRes = await axios.get(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(englishName)}&count=1&language=en&format=json`);
+    }
+
+    if (!geoRes.data.results || geoRes.data.results.length === 0) {
+      console.error(`❌ Geocoding failed for: ${destination}`);
+      return null;
+    }
+
+    const { latitude, longitude, name } = geoRes.data.results[0];
+    console.log(`✅ Geocoding success: ${name} (${latitude}, ${longitude})`);
 
     // 2. Weather Forecast
     const weatherRes = await axios.get(`https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto&start_date=${startDate}&end_date=${endDate}`);
 
-    if (!weatherRes.data.daily) return null;
+    if (!weatherRes.data.daily) {
+      console.error(`❌ Weather data is empty for ${name}`);
+      return null;
+    }
 
     const daily = weatherRes.data.daily;
     const weatherMap = {};
@@ -202,10 +250,17 @@ async function fetchDailyWeather(destination, startDate, endDate) {
       };
     });
 
+    console.log(`✅ Weather data fetched successfully for ${name}:`, Object.keys(weatherMap).length, 'days');
     return weatherMap;
   } catch (error) {
-    console.error("Weather Fetch Error:", error.message);
-    console.error("Weather API Details:", error.response?.data || error.stack);
+    console.error("❌ Weather Fetch Error:", error.message);
+    console.error("📍 Destination:", destination);
+    console.error("📅 Date Range:", startDate, "~", endDate);
+    if (error.response) {
+      console.error("🔴 API Response Error:", error.response.status, error.response.data);
+    } else {
+      console.error("🔴 Error Stack:", error.stack);
+    }
     return null;
   }
 }
