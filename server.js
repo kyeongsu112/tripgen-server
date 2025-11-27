@@ -102,7 +102,7 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
     let photoUrl = null;
     if (place.photos && place.photos.length > 0) {
       const photoReference = place.photos[0].name;
-      photoUrl = `https://places.googleapis.com/v1/${photoReference}/media?key=${GOOGLE_MAPS_API_KEY}&maxHeightPx=400&maxWidthPx=400`;
+      photoUrl = `https://places.googleapis.com/v1/${photoReference}/media?key=${GOOGLE_MAPS_API_KEY}&maxHeightPx=800&maxWidthPx=800`;
     }
 
     const placeData = {
