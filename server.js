@@ -49,13 +49,37 @@ function cleanAndParseJSON(text) {
   }
 }
 
-// 장소 상세 정보 조회 (지역 이탈 방지 로직 포함)
+// 장소 상세 정보 조회 (DB 캐싱 + 지역 이탈 방지 로직 포함)
 async function fetchPlaceDetails(placeName, cityContext = "") {
   if (placeName.includes("체크인") || placeName.includes("숙소") || placeName.includes("복귀")) {
     return { place_name: placeName, type: "숙소" };
   }
 
   try {
+    // [1] DB 캐시 먼저 확인
+    const { data: cachedPlace, error: cacheError } = await supabase
+      .from('places_cache')
+      .select('*')
+      .eq('place_name', placeName)
+      .maybeSingle();
+
+    if (cachedPlace && !cacheError) {
+      console.log(`✅ Cache Hit: ${placeName}`);
+      return {
+        place_id: cachedPlace.place_id,
+        place_name: cachedPlace.place_name,
+        rating: cachedPlace.rating || "정보 없음",
+        ratingCount: cachedPlace.rating_count || 0,
+        googleMapsUri: cachedPlace.google_maps_uri || "#",
+        websiteUri: cachedPlace.website_uri || null,
+        location: cachedPlace.location,
+        photoUrl: cachedPlace.photo_url,
+        types: cachedPlace.types || []
+      };
+    }
+
+    // [2] 캐시 Miss → Google Places API 호출
+    console.log(`🔍 Cache Miss → API Call: ${placeName}`);
     const query = cityContext ? `${cityContext} ${placeName}` : placeName;
 
     const response = await axios.post(
@@ -65,7 +89,8 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
         headers: {
           "Content-Type": "application/json",
           "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
-          "X-Goog-FieldMask": "places.id,places.rating,places.userRatingCount,places.googleMapsUri,places.location,places.websiteUri,places.types,places.displayName"
+          // ✨ photos 필드 추가됨
+          "X-Goog-FieldMask": "places.id,places.rating,places.userRatingCount,places.googleMapsUri,places.location,places.websiteUri,places.types,places.displayName,places.photos"
         }
       }
     );
@@ -73,14 +98,14 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
     const place = response.data.places && response.data.places[0];
     if (!place) return { place_name: placeName };
 
+    // [3] 사진 URL 생성 (활성화됨!)
     let photoUrl = null;
-    // [Billing Optimization] Disable Photo Fetching
-    // if (place.photos && place.photos.length > 0) {
-    //   const photoReference = place.photos[0].name;
-    //   photoUrl = `https://places.googleapis.com/v1/${photoReference}/media?key=${GOOGLE_MAPS_API_KEY}&maxHeightPx=400&maxWidthPx=400`;
-    // }
+    if (place.photos && place.photos.length > 0) {
+      const photoReference = place.photos[0].name;
+      photoUrl = `https://places.googleapis.com/v1/${photoReference}/media?key=${GOOGLE_MAPS_API_KEY}&maxHeightPx=400&maxWidthPx=400`;
+    }
 
-    return {
+    const placeData = {
       place_id: place.id,
       place_name: place.displayName?.text || placeName,
       rating: place.rating || "정보 없음",
@@ -91,8 +116,25 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
       photoUrl: photoUrl,
       types: place.types || []
     };
+
+    // [4] DB에 캐시 저장
+    await supabase.from('places_cache').insert([{
+      place_id: placeData.place_id,
+      place_name: placeData.place_name,
+      rating: typeof placeData.rating === 'number' ? placeData.rating : null,
+      rating_count: placeData.ratingCount,
+      google_maps_uri: placeData.googleMapsUri,
+      website_uri: placeData.websiteUri,
+      photo_url: placeData.photoUrl,
+      location: placeData.location,
+      types: placeData.types
+    }]).select();
+
+    console.log(`💾 Cached: ${placeData.place_name}`);
+
+    return placeData;
   } catch (error) {
-    console.error(`⚠️ 검색 실패: ${placeName}`);
+    console.error(`⚠️ 검색 실패: ${placeName}`, error.message);
     return { place_name: placeName };
   }
 }
