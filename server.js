@@ -710,6 +710,207 @@ app.get('/api/public/trip/:id', async (req, res) => {
   res.status(200).json({ success: true, data });
 });
 
+// --- [API 7] 내 여행 목록 조회 ---
+app.get('/api/my-trips', async (req, res) => {
+  const { user_id } = req.query;
+  if (!user_id) return res.status(400).json({ error: "User ID Required" });
+
+  try {
+    const { data, error } = await supabase
+      .from('trip_plans')
+      .select('*')
+      .eq('user_id', user_id)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    res.status(200).json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- [API 8] 여행 일정 삭제 ---
+app.delete('/api/trip/:id', async (req, res) => {
+  const { id } = req.params;
+  const { user_id } = req.body;
+
+  if (!user_id) return res.status(400).json({ error: "User ID Required" });
+
+  try {
+    const { error } = await supabase
+      .from('trip_plans')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', user_id);
+
+    if (error) throw error;
+    res.status(200).json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- [API 9] 커뮤니티 게시판 ---
+app.get('/api/community', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('community')
+      .select('*')
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.status(200).json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/community', async (req, res) => {
+  const { user_id, email, nickname, content, is_anonymous } = req.body;
+  if (!content) return res.status(400).json({ error: "내용이 필요합니다" });
+
+  try {
+    const { data, error } = await supabase.from('community').insert([{
+      user_id: user_id || null,
+      email: email || '익명',
+      nickname: nickname || '익명',
+      content,
+      is_anonymous: is_anonymous || false
+    }]).select();
+    if (error) throw error;
+    res.status(200).json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/community/:id', async (req, res) => {
+  const { id } = req.params;
+  const { user_id, email } = req.body;
+
+  try {
+    const { data: post } = await supabase
+      .from('community')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (!post) return res.status(404).json({ error: "게시글을 찾을 수 없습니다" });
+
+    const isOwner = user_id && post.user_id === user_id;
+    const isAdmin = email === ADMIN_EMAIL;
+
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({ error: "삭제 권한이 없습니다" });
+    }
+
+    const { error } = await supabase.from('community').delete().eq('id', id);
+    if (error) throw error;
+    res.status(200).json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- [API 10] 관리자 페이지 ---
+app.get('/api/admin/users', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('user_limits')
+      .select('user_id, tier, usage_count, ad_credits')
+      .order('usage_count', { ascending: false });
+
+    if (error) throw error;
+    res.status(200).json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/admin/user/tier', async (req, res) => {
+  const { target_user_id, new_tier } = req.body;
+
+  if (!target_user_id || !new_tier) {
+    return res.status(400).json({ error: "필수 정보가 누락되었습니다" });
+  }
+
+  try {
+    const { error } = await supabase
+      .from('user_limits')
+      .update({ tier: new_tier })
+      .eq('user_id', target_user_id);
+
+    if (error) throw error;
+    res.status(200).json({ success: true, message: "등급이 변경되었습니다" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- [API 11] 건의사항 삭제 ---
+app.delete('/api/board/:id', async (req, res) => {
+  const { id } = req.params;
+  const { user_id, email } = req.body;
+
+  try {
+    const { data: suggestion } = await supabase
+      .from('suggestions')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (!suggestion) return res.status(404).json({ error: "건의사항을 찾을 수 없습니다" });
+
+    const isOwner = user_id && suggestion.user_id === user_id;
+    const isAdmin = email === ADMIN_EMAIL;
+
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({ error: "삭제 권한이 없습니다" });
+    }
+
+    const { error } = await supabase.from('suggestions').delete().eq('id', id);
+    if (error) throw error;
+    res.status(200).json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- [API 12] 광고 리워드 (Alias) ---
+app.post('/api/redeem-ad-credit', async (req, res) => {
+  // 기존 /api/ad/redeem 로직 재사용
+  const { user_id } = req.body;
+  if (!user_id) return res.status(400).json({ error: "User ID Required" });
+
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    let { data: userLimit } = await supabase.from('user_limits').select('*').eq('user_id', user_id).single();
+
+    if (!userLimit) return res.status(404).json({ error: "User not found" });
+
+    const lastAdDate = userLimit.last_ad_watch_date ? new Date(userLimit.last_ad_watch_date).toISOString().split('T')[0] : null;
+    let dailyCount = userLimit.daily_ad_count || 0;
+
+    if (lastAdDate !== today) {
+      dailyCount = 0;
+    }
+
+    if (dailyCount >= 2) {
+      return res.status(403).json({ error: "일일 광고 시청 한도 초과 (최대 2회)" });
+    }
+
+    await supabase.from('user_limits').update({
+      ad_credits: (userLimit.ad_credits || 0) + 1,
+      daily_ad_count: dailyCount + 1,
+      last_ad_watch_date: new Date()
+    }).eq('user_id', user_id);
+
+    res.status(200).json({ success: true, credits: (userLimit.ad_credits || 0) + 1, dailyRemaining: 2 - dailyCount });
+  } catch (error) {
+    console.error("Redeem Ad Credit Error:", error);
+    res.status(500).json({ error: "크레딧 획득 실패" });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 TripGen Server running on port ${PORT}`);
 });
