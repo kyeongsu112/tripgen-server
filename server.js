@@ -69,6 +69,102 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
 
     // place_name OR search_keywords 검색
     const queryParts = [];
+    uniqueTerms.forEach(term => {
+      queryParts.push(`place_name.ilike.%${term}%`);
+      queryParts.push(`search_keywords.ilike.%${term}%`);
+    });
+    const queryStr = queryParts.join(',');
+
+    const { data: cachedPlaces, error: cacheError } = await supabase
+      .from('places_cache')
+      .select('*')
+      .or(queryStr)
+      .limit(1);
+
+    const cachedPlace = cachedPlaces && cachedPlaces[0];
+
+    if (cachedPlace && !cacheError) {
+      console.log(`✅ Cache Hit: ${placeName} (matched: ${cachedPlace.place_name})`);
+
+      // ✨ 사진 URL 동적 생성 (API 키 변경 대응)
+      let dynamicPhotoUrl = cachedPlace.photo_url;
+      if (cachedPlace.photo_reference) {
+        dynamicPhotoUrl = `https://places.googleapis.com/v1/${cachedPlace.photo_reference}/media?key=${GOOGLE_MAPS_API_KEY}&maxHeightPx=800&maxWidthPx=800`;
+      }
+
+      return {
+        place_id: cachedPlace.place_id,
+        place_name: cachedPlace.place_name,
+        rating: cachedPlace.rating || "정보 없음",
+        ratingCount: cachedPlace.rating_count || 0,
+        googleMapsUri: cachedPlace.google_maps_uri || "#",
+        websiteUri: cachedPlace.website_uri || null,
+        location: cachedPlace.location,
+        photoUrl: dynamicPhotoUrl, // ✨ 동적 생성된 URL 반환
+        types: cachedPlace.types || []
+      };
+    }
+
+    // [2] 캐시 Miss → Google Places API 호출
+    console.log(`🔍 Cache Miss → API Call: ${placeName}`);
+    const query = cityContext ? `${cityContext} ${placeName}` : placeName;
+
+    const response = await axios.post(
+      `https://places.googleapis.com/v1/places:searchText`,
+      { textQuery: query, languageCode: "ko" },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
+          "X-Goog-FieldMask": "places.id,places.rating,places.userRatingCount,places.googleMapsUri,places.location,places.websiteUri,places.types,places.displayName,places.photos"
+        }
+      }
+    );
+
+    const place = response.data.places && response.data.places[0];
+    if (!place) return { place_name: placeName };
+
+    // [3] 사진 URL 및 Reference 추출
+    let photoUrl = null;
+    let photoReference = null;
+    if (place.photos && place.photos.length > 0) {
+      photoReference = place.photos[0].name; // "places/PLACE_ID/photos/PHOTO_ID"
+      photoUrl = `https://places.googleapis.com/v1/${photoReference}/media?key=${GOOGLE_MAPS_API_KEY}&maxHeightPx=800&maxWidthPx=800`;
+    }
+
+    const placeData = {
+      place_id: place.id,
+      place_name: place.displayName?.text || placeName,
+      rating: place.rating || "정보 없음",
+      ratingCount: place.userRatingCount || 0,
+      googleMapsUri: place.googleMapsUri || "#",
+      websiteUri: place.websiteUri || null,
+      location: place.location,
+      photoUrl: photoUrl,
+      photoReference: photoReference, // ✨ Reference 저장용
+      types: place.types || []
+    };
+
+    // [4] DB에 캐시 저장 (search_keywords 포함)
+    const newKeywords = [placeName, placeData.place_name].join('|');
+
+    await supabase.from('places_cache').upsert([{
+      place_id: placeData.place_id,
+      place_name: placeData.place_name,
+      search_keywords: newKeywords,
+      rating: typeof placeData.rating === 'number' ? placeData.rating : null,
+      rating_count: placeData.ratingCount,
+      google_maps_uri: placeData.googleMapsUri,
+      website_uri: placeData.websiteUri,
+      photo_url: placeData.photoUrl,
+      photo_reference: placeData.photoReference, // ✨ Reference 저장
+      location: placeData.location,
+      types: placeData.types
+    }], { onConflict: 'place_id' }).select();
+
+    console.log(`💾 Cached: ${placeData.place_name} (keywords: ${newKeywords})`);
+
+    return placeData;
   } catch (error) {
     console.error(`⚠️ 검색 실패: ${placeName}`, error.message);
     return { place_name: placeName };
@@ -319,6 +415,8 @@ app.post('/api/generate-trip', async (req, res) => {
           placeDetailsCache.set(activity.place_name, detailsPromise);
           details = await detailsPromise;
         }
+
+        if (!details) details = { place_name: activity.place_name }; // ✨ 안전장치 추가
 
         let finalBookingUrl = null;
         const isPark = details.types && (details.types.includes('park') || details.types.includes('natural_feature'));
@@ -571,124 +669,32 @@ app.post('/api/board', async (req, res) => {
   }
 });
 
-app.delete('/api/board/:id', async (req, res) => {
-  const { id } = req.params;
-  const { user_id, email } = req.body;
-
-  try {
-    // 관리자 삭제
-    if (email === ADMIN_EMAIL) {
-      await supabaseAdmin.from('suggestions').delete().eq('id', id);
-      return res.status(200).json({ success: true });
-    }
-    // 본인 삭제
-    if (!user_id) return res.status(403).json({ error: "권한 없음" });
-    const { error } = await supabase.from('suggestions').delete().eq('id', id).eq('user_id', user_id);
-    if (error) throw error;
-    res.status(200).json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// --- [API 6] 공유 게시판 (Community) ---
-app.get('/api/community', async (req, res) => {
-  try {
-    const { data, error } = await supabase.from('community').select('*').order('created_at', { ascending: false });
-    if (error) throw error;
-    res.status(200).json({ success: true, data });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.post('/api/community', async (req, res) => {
-  const { user_id, email, nickname, content, is_anonymous } = req.body;
-
-  if (!content) return res.status(400).json({ error: "내용 입력" });
-  if (!user_id) return res.status(401).json({ error: "로그인 필요" });
-
-  try {
-    const { data, error } = await supabase.from('community').insert([{
-      user_id,
-      email,
-      nickname: nickname || email.split('@')[0],
-      content,
-      is_anonymous
-    }]).select();
-
-    if (error) throw error;
-    res.status(200).json({ success: true, data });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.delete('/api/community/:id', async (req, res) => {
-  const { id } = req.params;
-  const { user_id, email } = req.body;
-
-  try {
-    // 관리자 삭제
-    if (email === ADMIN_EMAIL) {
-      await supabaseAdmin.from('community').delete().eq('id', id);
-      return res.status(200).json({ success: true });
-    }
-    // 본인 삭제
-    if (!user_id) return res.status(403).json({ error: "권한 없음" });
-
-    const { error } = await supabase.from('community').delete().eq('id', id).eq('user_id', user_id);
-    if (error) throw error;
-    res.status(200).json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// --- 기타 API ---
-app.get('/api/my-trips', async (req, res) => {
-  const { user_id } = req.query;
-  if (!user_id) return res.status(400).json({ error: "로그인이 필요합니다." });
-  const { data, error } = await supabase.from('trip_plans').select('*').eq('user_id', user_id).order('created_at', { ascending: false });
-  res.status(200).json({ success: true, data });
-});
-
-app.delete('/api/trip/:id', async (req, res) => {
-  const { id } = req.params; const { user_id } = req.body;
-  const { error } = await supabase.from('trip_plans').delete().eq('id', id).eq('user_id', user_id);
-  res.status(200).json({ success: true, message: "삭제되었습니다." });
-});
-
-app.get('/api/admin/users', async (req, res) => {
-  const { data, error } = await supabaseAdmin.from('user_limits').select('*').order('created_at', { ascending: false });
-  res.status(200).json({ success: true, data });
-});
-
-app.put('/api/admin/user/tier', async (req, res) => {
-  const { target_user_id, new_tier } = req.body;
-  const { data, error } = await supabaseAdmin.from('user_limits').update({ tier: new_tier }).eq('user_id', target_user_id).select();
-  res.status(200).json({ success: true, message: "등급 변경 완료", data });
-});
-
-// --- [API 7] 광고 크레딧 획득 ---
-app.post('/api/redeem-ad-credit', async (req, res) => {
+// --- [API 6] 광고 리워드 적립 ---
+app.post('/api/ad/redeem', async (req, res) => {
   const { user_id } = req.body;
-  if (!user_id) return res.status(401).json({ error: "로그인 필요" });
+  if (!user_id) return res.status(400).json({ error: "User ID Required" });
 
   try {
-    const { data: userLimit } = await supabase.from('user_limits').select('*').eq('user_id', user_id).single();
-    if (!userLimit) return res.status(404).json({ error: "사용자 정보를 찾을 수 없습니다." });
-
     const today = new Date().toISOString().split('T')[0];
-    const lastAdDate = userLimit.last_ad_date ? new Date(userLimit.last_ad_date).toISOString().split('T')[0] : null;
+    let { data: userLimit } = await supabase.from('user_limits').select('*').eq('user_id', user_id).single();
+
+    if (!userLimit) return res.status(404).json({ error: "User not found" });
+
+    const lastAdDate = userLimit.last_ad_watch_date ? new Date(userLimit.last_ad_watch_date).toISOString().split('T')[0] : null;
     let dailyCount = userLimit.daily_ad_count || 0;
-    if (lastAdDate !== today) dailyCount = 0;
-    if (dailyCount >= 3) return res.status(429).json({ error: "오늘의 광고 시청 한도를 초과했습니다. (최대 3회)" });
+
+    if (lastAdDate !== today) {
+      dailyCount = 0;
+    }
+
+    if (dailyCount >= 2) {
+      return res.status(403).json({ error: "일일 광고 시청 한도 초과 (최대 2회)" });
+    }
 
     await supabase.from('user_limits').update({
       ad_credits: (userLimit.ad_credits || 0) + 1,
       daily_ad_count: dailyCount + 1,
-      last_ad_date: new Date()
+      last_ad_watch_date: new Date()
     }).eq('user_id', user_id);
 
     res.status(200).json({ success: true, credits: (userLimit.ad_credits || 0) + 1, dailyRemaining: 2 - dailyCount });
