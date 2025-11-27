@@ -181,50 +181,62 @@ async function calculateRoute(originId, destId) {
   return null;
 }
 
-// 날씨 정보 조회 (Open-Meteo) - 개선된 버전
+// 날씨 정보 조회 (Open-Meteo) - 개선된 버전 (Network Fix + Name Cleaning)
 async function fetchDailyWeather(destination, startDate, endDate) {
+  // 도시 이름 정제 함수
+  const cleanCityName = (rawName) => {
+    let name = rawName.replace(/일본|대한민국|한국|중국|미국|프랑스|이탈리아|스페인|영국|독일/g, '').trim();
+    // 공백으로 분리된 경우 마지막 단어 사용 (예: "교토부 교토시" -> "교토시")
+    if (name.includes(' ')) {
+      const parts = name.split(' ');
+      name = parts[parts.length - 1];
+    }
+    // 행정구역 접미사 제거 (시, 군, 구, 도, 부, 현)
+    return name.replace(/[시군구도부현]$/, '');
+  };
+
   try {
-    console.log(`🌤️ Weather Fetch Started: ${destination} (${startDate} ~ ${endDate})`);
+    const cleanedName = cleanCityName(destination);
+    console.log(`🌤️ Weather Fetch Started: ${destination} -> ${cleanedName} (${startDate} ~ ${endDate})`);
+
+    const axiosConfig = {
+      timeout: 5000, // 5초 타임아웃
+      family: 4      // IPv4 강제 (Node 17+ AggregateError 방지)
+    };
 
     // 1. Geocoding (한글 시도)
-    let geoRes = await axios.get(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(destination)}&count=1&language=ko&format=json`);
+    let geoRes = await axios.get(
+      `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(cleanedName)}&count=1&language=ko&format=json`,
+      axiosConfig
+    );
 
     // 한글로 검색 실패 시, 영어로 재시도
     if (!geoRes.data.results || geoRes.data.results.length === 0) {
-      console.log(`⚠️ Geocoding failed with Korean name, trying English...`);
+      console.log(`⚠️ Geocoding failed with Korean name (${cleanedName}), trying English...`);
 
       // 간단한 한영 변환 시도 (주요 도시만)
       const cityNameMap = {
-        '교토': 'Kyoto',
-        '오사카': 'Osaka',
-        '도쿄': 'Tokyo',
-        '후쿠오카': 'Fukuoka',
-        '삿포로': 'Sapporo',
-        '나고야': 'Nagoya',
-        '요코하마': 'Yokohama',
-        '서울': 'Seoul',
-        '부산': 'Busan',
-        '제주': 'Jeju',
-        '파리': 'Paris',
-        '런던': 'London',
-        '뉴욕': 'New York',
-        '로마': 'Rome',
-        '바르셀로나': 'Barcelona',
-        '방콕': 'Bangkok',
-        '홍콩': 'Hong Kong',
-        '싱가포르': 'Singapore',
-        '두바이': 'Dubai',
-        '시드니': 'Sydney'
+        '교토': 'Kyoto', '오사카': 'Osaka', '도쿄': 'Tokyo', '후쿠오카': 'Fukuoka',
+        '삿포로': 'Sapporo', '나고야': 'Nagoya', '요코하마': 'Yokohama', '오키나와': 'Okinawa',
+        '서울': 'Seoul', '부산': 'Busan', '제주': 'Jeju',
+        '파리': 'Paris', '런던': 'London', '뉴욕': 'New York', '로마': 'Rome',
+        '바르셀로나': 'Barcelona', '방콕': 'Bangkok', '홍콩': 'Hong Kong',
+        '싱가포르': 'Singapore', '두바이': 'Dubai', '시드니': 'Sydney',
+        '다낭': 'Da Nang', '호이안': 'Hoi An', '나트랑': 'Nha Trang', '푸꾸옥': 'Phu Quoc',
+        '타이베이': 'Taipei', '가오슝': 'Kaohsiung'
       };
 
-      const englishName = cityNameMap[destination] || destination;
+      const englishName = cityNameMap[cleanedName] || cleanedName;
       console.log(`🔄 Retrying with: ${englishName}`);
 
-      geoRes = await axios.get(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(englishName)}&count=1&language=en&format=json`);
+      geoRes = await axios.get(
+        `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(englishName)}&count=1&language=en&format=json`,
+        axiosConfig
+      );
     }
 
     if (!geoRes.data.results || geoRes.data.results.length === 0) {
-      console.error(`❌ Geocoding failed for: ${destination}`);
+      console.error(`❌ Geocoding failed for: ${destination} (cleaned: ${cleanedName})`);
       return null;
     }
 
@@ -232,7 +244,10 @@ async function fetchDailyWeather(destination, startDate, endDate) {
     console.log(`✅ Geocoding success: ${name} (${latitude}, ${longitude})`);
 
     // 2. Weather Forecast
-    const weatherRes = await axios.get(`https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto&start_date=${startDate}&end_date=${endDate}`);
+    const weatherRes = await axios.get(
+      `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto&start_date=${startDate}&end_date=${endDate}`,
+      axiosConfig
+    );
 
     if (!weatherRes.data.daily) {
       console.error(`❌ Weather data is empty for ${name}`);
@@ -254,8 +269,10 @@ async function fetchDailyWeather(destination, startDate, endDate) {
     return weatherMap;
   } catch (error) {
     console.error("❌ Weather Fetch Error:", error.message);
+    if (error.code === 'ECONNABORTED') {
+      console.error("⏰ Request timed out");
+    }
     console.error("📍 Destination:", destination);
-    console.error("📅 Date Range:", startDate, "~", endDate);
     if (error.response) {
       console.error("🔴 API Response Error:", error.response.status, error.response.data);
     } else {
