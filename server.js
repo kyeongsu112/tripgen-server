@@ -57,19 +57,21 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
 
   try {
     // [1] DB 캐시 먼저 확인
-    // 괄호나 쉼표로 분리하여 모든 부분 문자열에 대해 검색
-    const searchTerms = placeName.split(/[(),]+/)
+    // 괄호, 쉼표, 띄어쓰기로 분리하여 모든 부분 문자열에 대해 검색
+    const searchTerms = placeName.split(/[(),\s]+/)
       .map(p => p.trim())
       .filter(p => p.length > 1);
 
     searchTerms.push(placeName);
+    searchTerms.push(placeName.replace(/\s/g, '')); // ✨ 띄어쓰기 제거 버전 추가 (예: "남산 서울타워" -> "남산서울타워")
+
     const uniqueTerms = [...new Set(searchTerms)];
 
     // place_name OR search_keywords 검색
     const queryParts = [];
     uniqueTerms.forEach(term => {
       queryParts.push(`place_name.ilike.%${term}%`);
-      queryParts.push(`search_keywords.ilike.%${term}%`); // ✨ 추가된 검색 조건
+      queryParts.push(`search_keywords.ilike.%${term}%`);
     });
     const queryStr = queryParts.join(',');
 
@@ -91,7 +93,7 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
         googleMapsUri: cachedPlace.google_maps_uri || "#",
         websiteUri: cachedPlace.website_uri || null,
         location: cachedPlace.location,
-        photoUrl: cachedPlace.photo_url,
+        photoUrl: cachedPlace.photo_url, // ✨ 캐시된 사진 URL 반환
         types: cachedPlace.types || []
       };
     }
@@ -140,7 +142,7 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
     await supabase.from('places_cache').upsert([{
       place_id: placeData.place_id,
       place_name: placeData.place_name,
-      search_keywords: newKeywords, // ✨ 검색 키워드 저장
+      search_keywords: newKeywords,
       rating: typeof placeData.rating === 'number' ? placeData.rating : null,
       rating_count: placeData.ratingCount,
       google_maps_uri: placeData.googleMapsUri,
