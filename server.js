@@ -57,14 +57,16 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
 
   try {
     // [1] DB 캐시 먼저 확인
-    const { data: cachedPlace, error: cacheError } = await supabase
+    const { data: cachedPlaces, error: cacheError } = await supabase
       .from('places_cache')
       .select('*')
-      .eq('place_name', placeName)
-      .maybeSingle();
+      .or(`place_name.eq.${placeName},place_name.ilike.%${placeName}%`)
+      .limit(1);
+
+    const cachedPlace = cachedPlaces && cachedPlaces[0];
 
     if (cachedPlace && !cacheError) {
-      console.log(`✅ Cache Hit: ${placeName}`);
+      console.log(`✅ Cache Hit: ${placeName} (matched: ${cachedPlace.place_name})`);
       return {
         place_id: cachedPlace.place_id,
         place_name: cachedPlace.place_name,
@@ -118,7 +120,7 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
     };
 
     // [4] DB에 캐시 저장
-    await supabase.from('places_cache').insert([{
+    await supabase.from('places_cache').upsert([{
       place_id: placeData.place_id,
       place_name: placeData.place_name,
       rating: typeof placeData.rating === 'number' ? placeData.rating : null,
@@ -128,7 +130,7 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
       photo_url: placeData.photoUrl,
       location: placeData.location,
       types: placeData.types
-    }]).select();
+    }], { onConflict: 'place_id' }).select();
 
     console.log(`💾 Cached: ${placeData.place_name}`);
 
@@ -189,6 +191,7 @@ async function fetchDailyWeather(destination, startDate, endDate) {
     return weatherMap;
   } catch (error) {
     console.error("Weather Fetch Error:", error.message);
+    console.error("Weather API Details:", error.response?.data || error.stack);
     return null;
   }
 }
