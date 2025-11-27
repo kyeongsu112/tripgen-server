@@ -57,10 +57,24 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
 
   try {
     // [1] DB 캐시 먼저 확인
+    // 괄호나 쉼표로 분리하여 모든 부분 문자열에 대해 검색 (예: "금각사(킨카쿠지)" -> "금각사", "킨카쿠지")
+    const searchTerms = placeName.split(/[(),]+/)
+      .map(p => p.trim())
+      .filter(p => p.length > 1); // 2글자 이상만 검색 (노이즈 방지)
+
+    // 원래 전체 이름도 검색 조건에 포함
+    searchTerms.push(placeName);
+
+    // 중복 제거
+    const uniqueTerms = [...new Set(searchTerms)];
+
+    // OR 쿼리 생성: place_name.ilike.%term1%,place_name.ilike.%term2%...
+    const queryStr = uniqueTerms.map(term => `place_name.ilike.%${term}%`).join(',');
+
     const { data: cachedPlaces, error: cacheError } = await supabase
       .from('places_cache')
       .select('*')
-      .or(`place_name.eq.${placeName},place_name.ilike.%${placeName}%`)
+      .or(queryStr)
       .limit(1);
 
     const cachedPlace = cachedPlaces && cachedPlaces[0];
