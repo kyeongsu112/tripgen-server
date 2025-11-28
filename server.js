@@ -1,4 +1,4 @@
-require('dotenv').config();
+﻿require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -31,6 +31,18 @@ const ADMIN_EMAIL = process.env.NEXT_PUBLIC_ADMIN_EMAIL;
 
 const TIER_LIMITS = { free: 3, pro: 30, admin: Infinity };
 
+// --- [Optimization] Global In-Memory Cache (with Memory Safety) ---
+const placeDetailsCache = new Map();
+const MAX_CACHE_SIZE = 1000; // Prevent memory leak
+
+function addToCache(key, value) {
+  if (placeDetailsCache.size >= MAX_CACHE_SIZE) {
+    placeDetailsCache.clear(); // Simple strategy: clear all if full
+    console.log("🧹 Global Cache Cleared (Size Limit Reached)");
+  }
+  placeDetailsCache.set(key, value);
+}
+
 // --- [Helpers] ---
 function calculateDays(start, end) {
   const startDate = new Date(start);
@@ -58,21 +70,21 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
   try {
     // [1] DB 캐시 먼저 확인
     // 괄호, 쉼표, 띄어쓰기로 분리하여 모든 부분 문자열에 대해 검색
-    const searchTerms = placeName.split(/[(),\s]+/)
-      .map(p => p.trim())
-      .filter(p => p.length > 1);
+    // [1] DB 캐시 확인 (정확도 향상을 위해 단순화)
 
-    searchTerms.push(placeName);
-    searchTerms.push(placeName.replace(/\s/g, '')); // ✨ 띄어쓰기 제거 버전 추가 (예: "남산 서울타워" -> "남산서울타워")
-
-    const uniqueTerms = [...new Set(searchTerms)];
-
-    // place_name OR search_keywords 검색
+    // [1] DB 캐시 확인 (정확도 향상을 위해 단순화)
+    // 기존의 공격적인 분할 검색(split)은 다른 지역의 동명 이인 장소(예: 홍대 떡볶이 -> 제주 여행에 매칭)를 가져올 위험이 있어 제거함.
     const queryParts = [];
-    uniqueTerms.forEach(term => {
-      queryParts.push(`place_name.ilike.%${term}%`);
-      queryParts.push(`search_keywords.ilike.%${term}%`);
-    });
+    queryParts.push(`place_name.ilike.%${placeName}%`);
+    queryParts.push(`search_keywords.ilike.%${placeName}%`);
+
+    // 띄어쓰기 제거 버전도 체크
+    const noSpaceName = placeName.replace(/\s/g, '');
+    if (noSpaceName !== placeName) {
+      queryParts.push(`place_name.ilike.%${noSpaceName}%`);
+      queryParts.push(`search_keywords.ilike.%${noSpaceName}%`);
+    }
+
     const queryStr = queryParts.join(',');
 
     const { data: cachedPlaces, error: cacheError } = await supabase
@@ -86,37 +98,32 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
     if (cachedPlace && !cacheError) {
       console.log(`✅ Cache Hit: ${placeName} (matched: ${cachedPlace.place_name})`);
 
-      // ✨ 사진 URL 동적 생성 (API 키 변경 대응)
-      let dynamicPhotoUrl = cachedPlace.photo_url;
-      if (cachedPlace.photo_reference) {
-        dynamicPhotoUrl = `https://places.googleapis.com/v1/${cachedPlace.photo_reference}/media?key=${GOOGLE_MAPS_API_KEY}&maxHeightPx=800&maxWidthPx=800`;
+      // [Fix] If photo_url is missing but reference exists, generate it and update cache
+      if (!cachedPlace.photo_url && cachedPlace.photo_reference) {
+        const newPhotoUrl = `https://places.googleapis.com/v1/${cachedPlace.photo_reference}/media?maxHeightPx=400&maxWidthPx=400&key=${GOOGLE_MAPS_API_KEY}`;
+        cachedPlace.photo_url = newPhotoUrl;
+
+        // Update DB asynchronously
+        supabase.from('places_cache')
+          .update({ photo_url: newPhotoUrl })
+          .eq('place_id', cachedPlace.place_id)
+          .then(({ error }) => {
+            if (error) console.error("Failed to update cached photo URL:", error);
+            else console.log("🔄 Updated cached photo URL for:", cachedPlace.place_name);
+          });
       }
 
-      return {
-        place_id: cachedPlace.place_id,
-        place_name: cachedPlace.place_name,
-        rating: cachedPlace.rating || "정보 없음",
-        ratingCount: cachedPlace.rating_count || 0,
-        googleMapsUri: cachedPlace.google_maps_uri || "#",
-        websiteUri: cachedPlace.website_uri || null,
-        location: cachedPlace.location,
-        photoUrl: dynamicPhotoUrl, // ✨ 동적 생성된 URL 반환
-        types: cachedPlace.types || []
-      };
+      return cachedPlace;
     }
-
-    // [2] 캐시 Miss → Google Places API 호출
-    console.log(`🔍 Cache Miss → API Call: ${placeName}`);
-    const query = cityContext ? `${cityContext} ${placeName}` : placeName;
 
     const response = await axios.post(
       `https://places.googleapis.com/v1/places:searchText`,
-      { textQuery: query, languageCode: "ko" },
+      { textQuery: `${placeName} ${cityContext}`, languageCode: "ko" },
       {
         headers: {
           "Content-Type": "application/json",
           "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
-          "X-Goog-FieldMask": "places.id,places.rating,places.userRatingCount,places.googleMapsUri,places.location,places.websiteUri,places.types,places.displayName,places.photos"
+          "X-Goog-FieldMask": "places.id,places.rating,places.userRatingCount,places.googleMapsUri,places.location,places.websiteUri,places.types,places.displayName,places.photos,places.formattedAddress"
         }
       }
     );
@@ -124,29 +131,34 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
     const place = response.data.places && response.data.places[0];
     if (!place) return { place_name: placeName };
 
+    console.log(`📍 API Search Result: ${place.displayName?.text} (${place.formattedAddress})`);
+
     // [3] 사진 URL 및 Reference 추출
     let photoUrl = null;
     let photoReference = null;
     if (place.photos && place.photos.length > 0) {
-      photoReference = place.photos[0].name; // "places/PLACE_ID/photos/PHOTO_ID"
-      photoUrl = `https://places.googleapis.com/v1/${photoReference}/media?key=${GOOGLE_MAPS_API_KEY}&maxHeightPx=800&maxWidthPx=800`;
+      const photo = place.photos[0];
+      photoReference = photo.name; // "places/PLACE_ID/photos/PHOTO_ID" 형식
+      // Construct Photo URL (Places API New)
+      photoUrl = `https://places.googleapis.com/v1/${photoReference}/media?maxHeightPx=400&maxWidthPx=400&key=${GOOGLE_MAPS_API_KEY}`;
     }
 
     const placeData = {
       place_id: place.id,
       place_name: place.displayName?.text || placeName,
-      rating: place.rating || "정보 없음",
-      ratingCount: place.userRatingCount || 0,
-      googleMapsUri: place.googleMapsUri || "#",
-      websiteUri: place.websiteUri || null,
-      location: place.location,
+      rating: place.rating,
+      ratingCount: place.userRatingCount,
+      googleMapsUri: place.googleMapsUri,
+      websiteUri: place.websiteUri,
       photoUrl: photoUrl,
-      photoReference: photoReference, // ✨ Reference 저장용
-      types: place.types || []
+      photoReference: photoReference,
+      location: place.location,
+      types: place.types
     };
 
     // [4] DB에 캐시 저장 (search_keywords 포함)
-    const newKeywords = [placeName, placeData.place_name].join('|');
+    // 검색 키워드에 주소도 포함하여 지역 검색 정확도 향상
+    const newKeywords = [placeName, placeData.place_name, place.formattedAddress].filter(Boolean).join('|');
 
     await supabase.from('places_cache').upsert([{
       place_id: placeData.place_id,
@@ -157,7 +169,7 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
       google_maps_uri: placeData.googleMapsUri,
       website_uri: placeData.websiteUri,
       photo_url: placeData.photoUrl,
-      photo_reference: placeData.photoReference, // ✨ Reference 저장
+      photo_reference: placeData.photoReference,
       location: placeData.location,
       types: placeData.types
     }], { onConflict: 'place_id' }).select();
@@ -196,14 +208,11 @@ async function calculateRoute(originId, destId) {
 // 날씨 정보 조회 (Open-Meteo) - 개선된 버전 (Network Fix + Name Cleaning)
 async function fetchDailyWeather(destination, startDate, endDate) {
   // 도시 이름 정제 함수
+  // 도시 이름 정제 함수
   const cleanCityName = (rawName) => {
     let name = rawName.replace(/일본|대한민국|한국|중국|미국|프랑스|이탈리아|스페인|영국|독일/g, '').trim();
-    // 공백으로 분리된 경우 마지막 단어 사용 (예: "교토부 교토시" -> "교토시")
-    if (name.includes(' ')) {
-      const parts = name.split(' ');
-      name = parts[parts.length - 1];
-    }
-    // 행정구역 접미사 제거 (시, 군, 구, 도, 부, 현)
+    // [Fix] 공백 분리 로직 제거 (뉴욕 주 -> 주 되는 문제 해결)
+    // 필요한 경우에만 정제하도록 변경
     return name.replace(/[시군구도부현]$/, '');
   };
 
@@ -252,17 +261,17 @@ async function fetchDailyWeather(destination, startDate, endDate) {
       return null;
     }
 
-    const { latitude, longitude, name } = geoRes.data.results[0];
-    console.log(`✅ Geocoding success: ${name} (${latitude}, ${longitude})`);
+    const { latitude, longitude, name: geoName } = geoRes.data.results[0];
+    console.log(`✅ Geocoding success: ${geoName} (${latitude}, ${longitude})`);
 
     // 2. Weather Forecast
-    const weatherRes = await axios.get(
-      `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto&start_date=${startDate}&end_date=${endDate}`,
-      axiosConfig
-    );
+    const weatherUrl = `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto&start_date=${startDate}&end_date=${endDate}`;
+    console.log(`🌤️ Requesting Weather: ${weatherUrl}`);
+
+    const weatherRes = await axios.get(weatherUrl, axiosConfig);
 
     if (!weatherRes.data.daily) {
-      console.error(`❌ Weather data is empty for ${name}`);
+      console.error(`❌ Weather data is empty for ${geoName}`);
       return null;
     }
 
@@ -277,7 +286,7 @@ async function fetchDailyWeather(destination, startDate, endDate) {
       };
     });
 
-    console.log(`✅ Weather data fetched successfully for ${name}:`, Object.keys(weatherMap).length, 'days');
+    console.log(`✅ Weather data fetched successfully for ${geoName}:`, Object.keys(weatherMap).length, 'days');
     return weatherMap;
   } catch (error) {
     console.error("❌ Weather Fetch Error:", error.message);
@@ -289,8 +298,8 @@ async function fetchDailyWeather(destination, startDate, endDate) {
       console.error("🔴 API Response Error:", error.response.status, error.response.data);
     } else {
       console.error("🔴 Error Stack:", error.stack);
+      return null;
     }
-    return null;
   }
 }
 
@@ -357,7 +366,7 @@ app.post('/api/generate-trip', async (req, res) => {
       ✨ 사용자 요청: "${otherRequirements || "없음"}" (최우선 반영)
 
       [규칙]
-      1. **지역 고정:** 모든 장소는 반드시 **${destination}** 내에 있어야 합니다.
+      1. **[절대 원칙] 지역 고정:** 모든 장소는 반드시 **${destination}** 지역 내에 실제 위치해야 합니다. 이름만 같고 다른 지역에 있는 체인점이나, 엉뚱한 도시의 명소를 절대 포함하지 마세요. (예: 부산 여행에 '서울 남산타워' 추천 금지)
       2. **장소:** 구체적 상호명 필수 (예: '맛집' X -> '명동교자' O).
       3. **중복:** 같은 장소 반복 금지.
       4. **데이터:** photoUrl 등 상세 정보 제외.
@@ -383,14 +392,16 @@ app.post('/api/generate-trip', async (req, res) => {
       });
     }
 
-    // [Optimization] Request-Scoped Cache for Place Details
-    const placeDetailsCache = new Map();
+    // [Optimization] Global Cache used instead of Request-Scoped
+    // const placeDetailsCache = new Map(); // Removed local cache
 
     // 병렬 처리 & 데이터 보정
+    const seenPlaces = new Set(); // ✨ [Fix] Move seenPlaces OUT of the loop to track duplicates across ALL days
+
     await Promise.all(itineraryJson.itinerary.map(async (dayPlan) => {
       // 중복 제거
       const uniqueActivities = [];
-      const seenPlaces = new Set();
+      // const seenPlaces = new Set(); // Removed from inside loop
       dayPlan.activities.forEach(act => {
         if (act.place_name.includes("이동") || act.place_name.includes("숙소")) {
           uniqueActivities.push(act);
@@ -412,7 +423,7 @@ app.post('/api/generate-trip', async (req, res) => {
           details = await placeDetailsCache.get(activity.place_name);
         } else {
           const detailsPromise = fetchPlaceDetails(activity.place_name, destination);
-          placeDetailsCache.set(activity.place_name, detailsPromise);
+          addToCache(activity.place_name, detailsPromise); // Use global cache helper
           details = await detailsPromise;
         }
 
@@ -505,10 +516,14 @@ app.post('/api/modify-trip', async (req, res) => {
       ✨ [수정 요청]: "${userRequest}"
       
       [규칙]
-      1. **지역 고정:** ${destination} 이외의 장소 추천 금지.
+      1. **[절대 원칙] 지역 고정:** 추천하는 장소는 반드시 **${destination}** 내에 있어야 합니다. 다른 지역의 장소를 추천하면 절대 안 됩니다.
       2. 시간: 저녁까지 꽉 채움.
       3. 중복 금지, 구체적 상호명.
       4. **[중요] 장소 변경 시:** 사용자가 특정 활동(예: 점심, 저녁)을 다른 종류(예: 라멘, 초밥)로 바꿔달라고 하면, **반드시 'place_name'을 새로운 가게 이름으로 변경해야 합니다.** 기존 장소 이름을 그대로 두고 설명만 바꾸면 절대 안 됩니다.
+      - 예시: "점심을 라멘으로 바꿔줘" -> 기존 '명동교자'를 '이치란 라멘'으로 변경 (설명만 바꾸지 말 것!)
+      5. **[일관성 필수]** 'place_name'과 'activity_description'은 반드시 일치해야 합니다.
+      - 잘못된 예: place_name="스타벅스", activity_description="CGV에서 영화 관람" (X) -> 설명이 영화관이면 이름도 'CGV'여야 함.
+      - 수정 요청에 따라 장소의 성격이 바뀌면(예: 식당 -> 실내 관광지), 반드시 이름도 그에 맞는 곳으로 변경하세요.
       
       [출력] JSON Only.
     `;
@@ -520,9 +535,11 @@ app.post('/api/modify-trip', async (req, res) => {
 
     const modifiedJson = cleanAndParseJSON(result.response.text());
 
+    const seenPlaces = new Set(); // ✨ [Fix] Move seenPlaces OUT of the loop for modify-trip too
+
     await Promise.all(modifiedJson.itinerary.map(async (dayPlan) => {
       const uniqueActivities = [];
-      const seenPlaces = new Set();
+      // const seenPlaces = new Set(); // Removed from inside loop
       dayPlan.activities.forEach(act => {
         if (act.place_name.includes("이동") || act.place_name.includes("숙소")) {
           uniqueActivities.push(act);
@@ -543,7 +560,15 @@ app.post('/api/modify-trip', async (req, res) => {
           return { ...cached, ...activity };
         }
 
-        const details = await fetchPlaceDetails(activity.place_name, destination);
+        // [Fix] Use Global Cache for modify-trip too
+        let details;
+        if (placeDetailsCache.has(activity.place_name)) {
+          details = await placeDetailsCache.get(activity.place_name);
+        } else {
+          const detailsPromise = fetchPlaceDetails(activity.place_name, destination);
+          addToCache(activity.place_name, detailsPromise);
+          details = await detailsPromise;
+        }
         let finalBookingUrl = null;
         const isPark = details.types && (details.types.includes('park') || details.types.includes('natural_feature'));
         if (!isPark && activity.is_booking_required) {
@@ -594,8 +619,7 @@ app.get('/api/places/autocomplete', async (req, res) => {
       {
         input: query,
         languageCode: "ko",
-        // ✨ 도시/지역만 검색되도록 필터링 (야시장, 호텔 제외)
-        includedPrimaryTypes: ["locality", "administrative_area_level_1", "administrative_area_level_2"]
+        includedPrimaryTypes: ["locality", "administrative_area_level_1"]
       },
       {
         headers: {
@@ -606,12 +630,27 @@ app.get('/api/places/autocomplete', async (req, res) => {
     );
 
     const suggestions = response.data.suggestions || [];
-    const predictions = suggestions.map(item => ({
+    let predictions = suggestions.map(item => ({
       description: item.placePrediction.text.text,
-      place_id: item.placePrediction.placeId
+      place_id: item.placePrediction.placeId,
+      secondary_text: item.placePrediction.structuredFormat?.secondaryText?.text || "",
+      main_text: item.placePrediction.structuredFormat?.mainText?.text || item.placePrediction.text.text
     }));
 
-    res.status(200).json({ predictions });
+    // [Fix] 정렬 로직 개선:
+    // 1순위: Secondary Text가 단순한 것 (예: "미국" vs "미국 아이오와") - 주요 도시/주 우선
+    // 2순위: 이름 길이가 짧은 것 (정확도)
+    predictions.sort((a, b) => {
+      const aHasComplexSecondary = a.secondary_text.includes(' ');
+      const bHasComplexSecondary = b.secondary_text.includes(' ');
+
+      if (aHasComplexSecondary !== bHasComplexSecondary) {
+        return aHasComplexSecondary ? 1 : -1; // 단순한 것이 위로
+      }
+      return a.description.length - b.description.length; // 길이 짧은 순
+    });
+
+    res.status(200).json({ predictions: finalPredictions });
 
   } catch (error) {
     console.error("Autocomplete Error:", error.response?.data || error.message);
@@ -631,9 +670,8 @@ app.delete('/api/auth/delete', async (req, res) => {
     await supabase.from('trip_plans').delete().eq('user_id', user_id);
     await supabase.from('user_limits').delete().eq('user_id', user_id);
     await supabase.from('suggestions').delete().eq('user_id', user_id);
-    await supabase.from('community').delete().eq('user_id', user_id); // ✨ 커뮤니티 글도 삭제
+    await supabase.from('community').delete().eq('user_id', user_id);
 
-    // ✨ Supabase Auth 유저 영구 삭제 (Service Key 필요)
     const { error: deleteError } = await supabaseAdmin.auth.admin.deleteUser(user_id);
     if (deleteError) throw deleteError;
 
