@@ -61,61 +61,67 @@ function cleanAndParseJSON(text) {
   }
 }
 
-// 장소 상세 정보 조회 (DB 캐싱 + 지역 이탈 방지 로직 포함)
+// --- [Helper] Naver Image Search ---
+async function fetchNaverImage(query) {
+  try {
+    const response = await axios.get('https://openapi.naver.com/v1/search/image', {
+      params: { query: query, display: 1, sort: 'sim' },
+      headers: {
+        'X-Naver-Client-Id': process.env.NAVER_CLIENT_ID,
+        'X-Naver-Client-Secret': process.env.NAVER_CLIENT_SECRET
+      }
+    });
+    if (response.data.items && response.data.items.length > 0) {
+      return response.data.items[0].link; // 이미지 URL 반환
+    }
+  } catch (error) {
+    console.error(`⚠️ Naver Image Search Failed for ${query}:`, error.message);
+  }
+  return null;
+}
+
+// 장소 상세 정보 조회 (Cache -> Naver Image -> Google API)
 async function fetchPlaceDetails(placeName, cityContext = "") {
   if (placeName.includes("체크인") || placeName.includes("숙소") || placeName.includes("복귀")) {
     return { place_name: placeName, type: "숙소" };
   }
 
-  try {
-    // [1] DB 캐시 먼저 확인
-    // 괄호, 쉼표, 띄어쓰기로 분리하여 모든 부분 문자열에 대해 검색
-    // [1] DB 캐시 확인 (정확도 향상을 위해 단순화)
+  // [1] Check Cache
+  if (placeDetailsCache.has(placeName)) {
+    return placeDetailsCache.get(placeName);
+  }
 
-    // [1] DB 캐시 확인 (정확도 향상을 위해 단순화)
-    // 기존의 공격적인 분할 검색(split)은 다른 지역의 동명 이인 장소(예: 홍대 떡볶이 -> 제주 여행에 매칭)를 가져올 위험이 있어 제거함.
-    const queryParts = [];
-    queryParts.push(`place_name.ilike.%${placeName}%`);
-    queryParts.push(`search_keywords.ilike.%${placeName}%`);
+  // [2] Check DB Cache (Supabase)
+  const { data: cachedPlace } = await supabase
+    .from('places_cache')
+    .select('*')
+    .or(`place_name.eq.${placeName},search_keywords.ilike.%${placeName}%`)
+    .limit(1)
+    .maybeSingle();
 
-    // 띄어쓰기 제거 버전도 체크
-    const noSpaceName = placeName.replace(/\s/g, '');
-    if (noSpaceName !== placeName) {
-      queryParts.push(`place_name.ilike.%${noSpaceName}%`);
-      queryParts.push(`search_keywords.ilike.%${noSpaceName}%`);
-    }
+  if (cachedPlace) {
+    // Cache Hit
+    placeDetailsCache.set(placeName, cachedPlace);
 
-    const queryStr = queryParts.join(',');
-
-    const { data: cachedPlaces, error: cacheError } = await supabase
-      .from('places_cache')
-      .select('*')
-      .or(queryStr)
-      .limit(1);
-
-    const cachedPlace = cachedPlaces && cachedPlaces[0];
-
-    if (cachedPlace && !cacheError) {
-      console.log(`✅ Cache Hit: ${placeName} (matched: ${cachedPlace.place_name})`);
-
-      // [Fix] If photo_url is missing but reference exists, generate it and update cache
-      if (!cachedPlace.photo_url && cachedPlace.photo_reference) {
-        const newPhotoUrl = `https://places.googleapis.com/v1/${cachedPlace.photo_reference}/media?maxHeightPx=400&maxWidthPx=400&key=${GOOGLE_MAPS_API_KEY}`;
-        cachedPlace.photo_url = newPhotoUrl;
-
+    // [Fix] If photo_url is missing, try Naver Image Search
+    if (!cachedPlace.photo_url) {
+      const naverImage = await fetchNaverImage(`${cityContext} ${placeName}`);
+      if (naverImage) {
+        cachedPlace.photo_url = naverImage;
         // Update DB asynchronously
         supabase.from('places_cache')
-          .update({ photo_url: newPhotoUrl })
+          .update({ photo_url: naverImage })
           .eq('place_id', cachedPlace.place_id)
           .then(({ error }) => {
-            if (error) console.error("Failed to update cached photo URL:", error);
-            else console.log("🔄 Updated cached photo URL for:", cachedPlace.place_name);
+            if (!error) console.log("🔄 Updated cached photo URL (Naver) for:", cachedPlace.place_name);
           });
       }
-
-      return cachedPlace;
     }
+    return cachedPlace;
+  }
 
+  // [3] Google Places API Call (for details)
+  try {
     const response = await axios.post(
       `https://places.googleapis.com/v1/places:searchText`,
       { textQuery: `${placeName} ${cityContext}`, languageCode: "ko" },
@@ -123,7 +129,7 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
         headers: {
           "Content-Type": "application/json",
           "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
-          "X-Goog-FieldMask": "places.id,places.rating,places.userRatingCount,places.googleMapsUri,places.location,places.websiteUri,places.types,places.displayName,places.photos,places.formattedAddress"
+          "X-Goog-FieldMask": "places.id,places.rating,places.userRatingCount,places.googleMapsUri,places.location,places.websiteUri,places.types,places.displayName,places.formattedAddress"
         }
       }
     );
@@ -133,15 +139,10 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
 
     console.log(`📍 API Search Result: ${place.displayName?.text} (${place.formattedAddress})`);
 
-    // [3] 사진 URL 및 Reference 추출
-    let photoUrl = null;
-    let photoReference = null;
-    if (place.photos && place.photos.length > 0) {
-      const photo = place.photos[0];
-      photoReference = photo.name; // "places/PLACE_ID/photos/PHOTO_ID" 형식
-      // Construct Photo URL (Places API New)
-      photoUrl = `https://places.googleapis.com/v1/${photoReference}/media?maxHeightPx=400&maxWidthPx=400&key=${GOOGLE_MAPS_API_KEY}`;
-    }
+    // [4] Naver Image Search (Primary)
+    // Google Photos are expensive, so we use Naver Image Search first.
+    let photoUrl = await fetchNaverImage(`${cityContext} ${placeName}`);
+    let photoReference = null; // We don't use Google Photo Reference anymore to save cost
 
     const placeData = {
       place_id: place.id,
@@ -156,8 +157,7 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
       types: place.types
     };
 
-    // [4] DB에 캐시 저장 (search_keywords 포함)
-    // 검색 키워드에 주소도 포함하여 지역 검색 정확도 향상
+    // [5] DB에 캐시 저장
     const newKeywords = [placeName, placeData.place_name, place.formattedAddress].filter(Boolean).join('|');
 
     await supabase.from('places_cache').upsert([{
