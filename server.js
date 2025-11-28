@@ -650,7 +650,7 @@ app.get('/api/places/autocomplete', async (req, res) => {
       return a.description.length - b.description.length; // 길이 짧은 순
     });
 
-    res.status(200).json({ predictions: finalPredictions });
+    res.status(200).json({ predictions: predictions });
 
   } catch (error) {
     console.error("Autocomplete Error:", error.response?.data || error.message);
