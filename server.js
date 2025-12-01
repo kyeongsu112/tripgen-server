@@ -66,6 +66,27 @@ function cleanAndParseJSON(text) {
   }
 }
 
+// 네이버 이미지 검색 (Naver Search API)
+async function fetchNaverImage(query) {
+  const clientId = process.env.NAVER_CLIENT_ID;
+  const clientSecret = process.env.NAVER_CLIENT_SECRET;
+
+  if (!clientId || !clientSecret) return null;
+
+  try {
+    const response = await axios.get('https://openapi.naver.com/v1/search/image', {
+      params: { query: query, display: 1, sort: 'sim', filter: 'medium' },
+      headers: { 'X-Naver-Client-Id': clientId, 'X-Naver-Client-Secret': clientSecret }
+    });
+    if (response.data.items && response.data.items.length > 0) {
+      return response.data.items[0].link;
+    }
+  } catch (error) {
+    console.error(`Naver Image Search Error for ${query}:`, error.message);
+  }
+  return null;
+}
+
 // 장소 상세 정보 조회 (Cache -> Naver Image -> Google API)
 async function fetchPlaceDetails(placeName, cityContext = "") {
   if (placeName.includes("체크인") || placeName.includes("숙소") || placeName.includes("복귀")) {
@@ -567,9 +588,10 @@ app.post('/api/modify-trip', async (req, res) => {
 
     const seenPlaces = new Set(); // ✨ [Fix] Move seenPlaces OUT of the loop for modify-trip too
 
-    await Promise.all(modifiedJson.itinerary.map(async (dayPlan) => {
+    // ✨ [Optimization] 순차 처리 (Sequential Processing) for modify-trip
+    // 네이버 API 429 에러 방지를 위해 Promise.all 대신 for...of 루프 사용
+    for (const dayPlan of modifiedJson.itinerary) {
       const uniqueActivities = [];
-      // const seenPlaces = new Set(); // Removed from inside loop
       dayPlan.activities.forEach(act => {
         if (act.place_name.includes("이동") || act.place_name.includes("숙소")) {
           uniqueActivities.push(act);
@@ -582,23 +604,30 @@ app.post('/api/modify-trip', async (req, res) => {
       });
       dayPlan.activities = uniqueActivities;
 
-      const enrichedActivities = await Promise.all(dayPlan.activities.map(async (activity) => {
-        if (activity.place_name.includes("이동") && !activity.place_name.includes("숙소")) return null;
-
-        if (existingPlacesMap.has(activity.place_name)) {
-          const cached = existingPlacesMap.get(activity.place_name);
-          return { ...cached, ...activity };
+      const enrichedActivities = [];
+      for (const activity of dayPlan.activities) {
+        if (activity.place_name.includes("이동") && !activity.place_name.includes("숙소")) {
+          // 이동은 null로 처리하지 않고 건너뜀 (enrichedActivities에 추가 안함)
+          continue;
         }
 
-        // [Fix] Use Global Cache for modify-trip too
+        // 💡 [Rate Limit 방지] 요청 사이에 0.2초 딜레이
+        await delay(200);
+
         let details;
-        if (placeDetailsCache.has(activity.place_name)) {
+        if (existingPlacesMap.has(activity.place_name)) {
+          const cached = existingPlacesMap.get(activity.place_name);
+          details = { ...cached, ...activity };
+        } else if (placeDetailsCache.has(activity.place_name)) {
           details = await placeDetailsCache.get(activity.place_name);
         } else {
           const detailsPromise = fetchPlaceDetails(activity.place_name, destination);
           addToCache(activity.place_name, detailsPromise);
           details = await detailsPromise;
         }
+
+        if (!details) details = { place_name: activity.place_name };
+
         let finalBookingUrl = null;
         const isPark = details.types && (details.types.includes('park') || details.types.includes('natural_feature'));
         if (!isPark && activity.is_booking_required) {
@@ -608,10 +637,10 @@ app.post('/api/modify-trip', async (req, res) => {
         }
         activity.booking_url = finalBookingUrl;
 
-        return { ...activity, ...details, place_name: details.place_name || activity.place_name };
-      }));
+        enrichedActivities.push({ ...activity, ...details, place_name: details.place_name || activity.place_name });
+      }
 
-      dayPlan.activities = enrichedActivities.filter(a => a !== null);
+      dayPlan.activities = enrichedActivities;
 
       for (let i = 1; i < dayPlan.activities.length; i++) {
         const prev = dayPlan.activities[i - 1];
@@ -621,7 +650,7 @@ app.post('/api/modify-trip', async (req, res) => {
           if (routeInfo) curr.travel_info = routeInfo;
         }
       }
-    }));
+    }
 
     // DB 업데이트
     if (trip_id) {
