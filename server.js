@@ -36,6 +36,23 @@ const SERVER_BASE_URL = process.env.SERVER_BASE_URL || "http://localhost:8080";
 const TIER_LIMITS = { free: 3, pro: 30, admin: Infinity };
 const FALLBACK_IMAGE_URL = "https://images.unsplash.com/photo-1476514525535-07fb3b4ae5f1?q=80&w=800&auto=format&fit=crop";
 
+const FALLBACK_IMAGES = {
+  food: "https://images.unsplash.com/photo-1504674900247-0877df9cc836?q=80&w=800&auto=format&fit=crop",
+  nature: "https://images.unsplash.com/photo-1441974231531-c6227db76b6e?q=80&w=800&auto=format&fit=crop",
+  city: "https://images.unsplash.com/photo-1449824913935-59a10b8d2000?q=80&w=800&auto=format&fit=crop",
+  culture: "https://images.unsplash.com/photo-1566073771259-6a8506099945?q=80&w=800&auto=format&fit=crop",
+  hotel: "https://images.unsplash.com/photo-1566073771259-6a8506099945?q=80&w=800&auto=format&fit=crop"
+};
+
+function getFallbackImage(types = []) {
+  if (!types || types.length === 0) return FALLBACK_IMAGES.default || FALLBACK_IMAGE_URL;
+  if (types.some(t => ['restaurant', 'food', 'cafe', 'bar', 'bakery', 'meal_takeaway'].includes(t))) return FALLBACK_IMAGES.food;
+  if (types.some(t => ['park', 'campground', 'natural_feature', 'amusement_park'].includes(t))) return FALLBACK_IMAGES.nature;
+  if (types.some(t => ['museum', 'art_gallery', 'church', 'place_of_worship', 'library', 'university'].includes(t))) return FALLBACK_IMAGES.culture;
+  if (types.some(t => ['lodging', 'hotel', 'guest_house'].includes(t))) return FALLBACK_IMAGES.hotel;
+  return FALLBACK_IMAGES.city;
+}
+
 // --- [Optimization] Global In-Memory Cache (with Memory Safety) ---
 const placeDetailsCache = new Map();
 const MAX_CACHE_SIZE = 1000; // Prevent memory leak
@@ -157,7 +174,9 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
     let photoUrl = await fetchNaverImage(searchQuery);
 
     // 만약 네이버 이미지를 못 찾았다면? -> Fallback 이미지 사용 (구글 포토 호출 X)
-    // 필요하다면 여기서 로직을 추가할 수 있습니다.
+    if (!photoUrl) {
+      photoUrl = getFallbackImage(place.types);
+    }
 
     const placeData = {
       place_id: place.id,
