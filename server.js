@@ -169,7 +169,18 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
     // [4] Naver Image Search (Primary)
     // 💡 구글 장소명이 더 정확하므로 구글이 준 이름(place.displayName.text)을 사용하여 검색
     const searchName = place.displayName?.text || placeName;
-    const searchQuery = cityContext ? `${cityContext} ${searchName}` : searchName;
+
+    // ✨ [Optimization] 검색어 정밀화 (Context-Aware Search)
+    const getSearchSuffix = (types = []) => {
+      if (types.some(t => ['restaurant', 'food', 'cafe', 'bar', 'bakery', 'meal_takeaway'].includes(t))) return " 음식"; // 맛집/음식
+      if (types.some(t => ['tourist_attraction', 'point_of_interest', 'park', 'landmark'].includes(t))) return " 전경"; // 풍경/전경
+      if (types.some(t => ['lodging', 'hotel', 'guest_house'].includes(t))) return " 객실"; // 호텔/숙소
+      if (types.some(t => ['shopping_mall', 'store'].includes(t))) return " 매장"; // 쇼핑/매장
+      return " 사진"; // 기본
+    };
+
+    const suffix = getSearchSuffix(place.types);
+    const searchQuery = cityContext ? `${cityContext} ${searchName}${suffix}` : `${searchName}${suffix}`;
 
     let photoUrl = await fetchNaverImage(searchQuery);
 
