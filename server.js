@@ -28,8 +28,10 @@ const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 // 관리자 이메일
 const ADMIN_EMAIL = process.env.NEXT_PUBLIC_ADMIN_EMAIL;
+const SERVER_BASE_URL = process.env.SERVER_BASE_URL || "http://localhost:8080";
 
 const TIER_LIMITS = { free: 3, pro: 30, admin: Infinity };
+const FALLBACK_IMAGE_URL = "https://images.unsplash.com/photo-1476514525535-07fb3b4ae5f1?q=80&w=800&auto=format&fit=crop";
 
 // --- [Optimization] Global In-Memory Cache (with Memory Safety) ---
 const placeDetailsCache = new Map();
@@ -56,28 +58,9 @@ function cleanAndParseJSON(text) {
     const cleaned = text.replace(/```json/g, "").replace(/```/g, "").trim();
     return JSON.parse(cleaned);
   } catch (e) {
-    console.error("JSON Parse Fail. Raw Text Start:", text.substring(0, 500));
-    throw new Error("AI 응답 형식이 올바르지 않습니다.");
+    console.error("JSON Parse Error:", e);
+    return null;
   }
-}
-
-// --- [Helper] Naver Image Search ---
-async function fetchNaverImage(query) {
-  try {
-    const response = await axios.get('https://openapi.naver.com/v1/search/image', {
-      params: { query: query, display: 1, sort: 'sim' },
-      headers: {
-        'X-Naver-Client-Id': process.env.NAVER_CLIENT_ID,
-        'X-Naver-Client-Secret': process.env.NAVER_CLIENT_SECRET
-      }
-    });
-    if (response.data.items && response.data.items.length > 0) {
-      return response.data.items[0].link; // 이미지 URL 반환
-    }
-  } catch (error) {
-    console.error(`⚠️ Naver Image Search Failed for ${query}:`, error.message);
-  }
-  return null;
 }
 
 // 장소 상세 정보 조회 (Cache -> Naver Image -> Google API)
@@ -86,7 +69,7 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
     return { place_name: placeName, type: "숙소" };
   }
 
-  // [1] Check Cache
+  // [1] Check Memory Cache
   if (placeDetailsCache.has(placeName)) {
     return placeDetailsCache.get(placeName);
   }
@@ -100,27 +83,29 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
     .maybeSingle();
 
   if (cachedPlace) {
-    // Cache Hit
     placeDetailsCache.set(placeName, cachedPlace);
 
-    // [Fix] If photo_url is missing, try Naver Image Search
+    // [Self-Healing] 이미지가 없으면 네이버에서 다시 찾아 채워넣음
     if (!cachedPlace.photo_url) {
-      const naverImage = await fetchNaverImage(`${cityContext} ${placeName}`);
+      // 💡 검색어 조합: "도시명 + 장소명"이 가장 정확함
+      const searchQuery = cityContext ? `${cityContext} ${placeName}` : placeName;
+      const naverImage = await fetchNaverImage(searchQuery);
+
       if (naverImage) {
         cachedPlace.photo_url = naverImage;
-        // Update DB asynchronously
+        // 비동기 업데이트 (사용자 응답 대기 안 함)
         supabase.from('places_cache')
           .update({ photo_url: naverImage })
           .eq('place_id', cachedPlace.place_id)
           .then(({ error }) => {
-            if (!error) console.log("🔄 Updated cached photo URL (Naver) for:", cachedPlace.place_name);
+            if (!error) console.log("🔄 Updated cached photo URL (Naver) for:", placeName);
           });
       }
     }
     return cachedPlace;
   }
 
-  // [3] Google Places API Call (for details)
+  // [3] Google Places API Call (텍스트 정보만! 사진 X)
   try {
     const response = await axios.post(
       `https://places.googleapis.com/v1/places:searchText`,
@@ -129,6 +114,7 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
         headers: {
           "Content-Type": "application/json",
           "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
+          // 🚨 photos 필드 제외 확인 (비용 절감)
           "X-Goog-FieldMask": "places.id,places.rating,places.userRatingCount,places.googleMapsUri,places.location,places.websiteUri,places.types,places.displayName,places.formattedAddress"
         }
       }
@@ -137,22 +123,27 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
     const place = response.data.places && response.data.places[0];
     if (!place) return { place_name: placeName };
 
-    console.log(`📍 API Search Result: ${place.displayName?.text} (${place.formattedAddress})`);
+    console.log(`📍 API Search Result: ${place.displayName?.text}`);
 
     // [4] Naver Image Search (Primary)
-    // Google Photos are expensive, so we use Naver Image Search first.
-    let photoUrl = await fetchNaverImage(`${cityContext} ${placeName}`);
-    let photoReference = null; // We don't use Google Photo Reference anymore to save cost
+    // 💡 구글 장소명이 더 정확하므로 구글이 준 이름(place.displayName.text)을 사용하여 검색
+    const searchName = place.displayName?.text || placeName;
+    const searchQuery = cityContext ? `${cityContext} ${searchName}` : searchName;
+
+    let photoUrl = await fetchNaverImage(searchQuery);
+
+    // 만약 네이버 이미지를 못 찾았다면? -> Fallback 이미지 사용 (구글 포토 호출 X)
+    // 필요하다면 여기서 로직을 추가할 수 있습니다.
 
     const placeData = {
       place_id: place.id,
-      place_name: place.displayName?.text || placeName,
+      place_name: searchName, // 정제된 구글 장소명 사용
       rating: place.rating,
       ratingCount: place.userRatingCount,
       googleMapsUri: place.googleMapsUri,
       websiteUri: place.websiteUri,
-      photoUrl: photoUrl,
-      photoReference: photoReference,
+      photoUrl: photoUrl, // 네이버 이미지
+      photoReference: null,
       location: place.location,
       types: place.types
     };
@@ -164,17 +155,17 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
       place_id: placeData.place_id,
       place_name: placeData.place_name,
       search_keywords: newKeywords,
-      rating: typeof placeData.rating === 'number' ? placeData.rating : null,
+      rating: placeData.rating,
       rating_count: placeData.ratingCount,
       google_maps_uri: placeData.googleMapsUri,
       website_uri: placeData.websiteUri,
       photo_url: placeData.photoUrl,
-      photo_reference: placeData.photoReference,
+      photo_reference: null,
       location: placeData.location,
       types: placeData.types
     }], { onConflict: 'place_id' }).select();
 
-    console.log(`💾 Cached: ${placeData.place_name} (keywords: ${newKeywords})`);
+    addToCache(placeName, placeData); // 메모리 캐시에도 저장
 
     return placeData;
   } catch (error) {
@@ -207,7 +198,6 @@ async function calculateRoute(originId, destId) {
 
 // 날씨 정보 조회 (Open-Meteo) - 개선된 버전 (Network Fix + Name Cleaning)
 async function fetchDailyWeather(destination, startDate, endDate) {
-  // 도시 이름 정제 함수
   // 도시 이름 정제 함수
   const cleanCityName = (rawName) => {
     let name = rawName.replace(/일본|대한민국|한국|중국|미국|프랑스|이탈리아|스페인|영국|독일/g, '').trim();
@@ -398,10 +388,12 @@ app.post('/api/generate-trip', async (req, res) => {
     // 병렬 처리 & 데이터 보정
     const seenPlaces = new Set(); // ✨ [Fix] Move seenPlaces OUT of the loop to track duplicates across ALL days
 
-    await Promise.all(itineraryJson.itinerary.map(async (dayPlan) => {
-      // 중복 제거
+    // 2. 병렬 처리 대신 "순차 처리(Sequential)"로 변경하여 API 부하 분산
+    // Promise.all 대신 for...of 루프 사용
+    for (const dayPlan of itineraryJson.itinerary) {
       const uniqueActivities = [];
-      // const seenPlaces = new Set(); // Removed from inside loop
+
+      // 중복 제거 로직
       dayPlan.activities.forEach(act => {
         if (act.place_name.includes("이동") || act.place_name.includes("숙소")) {
           uniqueActivities.push(act);
@@ -414,8 +406,15 @@ app.post('/api/generate-trip', async (req, res) => {
       });
       dayPlan.activities = uniqueActivities;
 
-      const enrichedActivities = await Promise.all(dayPlan.activities.map(async (activity) => {
-        if (activity.place_name.includes("이동") && !activity.place_name.includes("숙소")) return null;
+      // 액티비티 상세 정보 조회 (순차 처리 + 딜레이)
+      for (let i = 0; i < dayPlan.activities.length; i++) {
+        const activity = dayPlan.activities[i];
+
+        // 이동/숙소는 패스하지만, 정보가 필요하면 로직 유지
+        if (activity.place_name.includes("이동") && !activity.place_name.includes("숙소")) continue;
+
+        // 💡 [Rate Limit 방지] 요청 사이에 0.2초 딜레이
+        await delay(200);
 
         // [Cache Check]
         let details;
@@ -437,13 +436,17 @@ app.post('/api/generate-trip', async (req, res) => {
           else if (details.googleMapsUri) finalBookingUrl = details.googleMapsUri;
           else finalBookingUrl = `https://www.google.com/search?q=${destination}+${activity.place_name}+예약`;
         }
-        activity.booking_url = finalBookingUrl;
 
-        return { ...activity, ...details, place_name: details.place_name || activity.place_name };
-      }));
+        // 객체 업데이트
+        dayPlan.activities[i] = {
+          ...activity,
+          ...details,
+          booking_url: finalBookingUrl,
+          place_name: details.place_name || activity.place_name
+        };
+      }
 
-      dayPlan.activities = enrichedActivities.filter(a => a !== null);
-
+      // 경로 계산 (순차 처리)
       for (let i = 1; i < dayPlan.activities.length; i++) {
         const prev = dayPlan.activities[i - 1];
         const curr = dayPlan.activities[i];
@@ -452,12 +455,36 @@ app.post('/api/generate-trip', async (req, res) => {
           if (routeInfo) curr.travel_info = routeInfo;
         }
       }
-    }));
+    }
+
+    // ✨ [New] 대표 이미지(Cover Image) 선정 로직
+    // 전체 일정 중 'tourist_attraction' 타입이면서 사진이 있는 곳을 찾음
+    let bestCoverImage = null;
+    let fallbackImage = null;
+
+    for (const day of itineraryJson.itinerary) {
+      for (const act of day.activities) {
+        if (act.photoUrl) {
+          // 1순위: 관광지 사진
+          if (act.types && act.types.includes('tourist_attraction')) {
+            bestCoverImage = act.photoUrl;
+            break; // 찾았으면 루프 종료
+          }
+          // 2순위: 아무 사진이나 (백업용)
+          if (!fallbackImage) fallbackImage = act.photoUrl;
+        }
+      }
+      if (bestCoverImage) break;
+    }
+
+    // 관광지 사진이 없으면 백업 사진 사용, 그것도 없으면 Unsplash/고정 이미지 사용은 프론트에서 처리
+    itineraryJson.cover_image = bestCoverImage || fallbackImage || null;
 
     const { data, error } = await supabase.from('trip_plans').insert([{
       destination, duration: `${startDate} ~ ${endDate}`,
       style: "맞춤 여행", companions: "제한 없음",
-      itinerary_data: itineraryJson, user_id
+      itinerary_data: itineraryJson, // cover_image가 포함된 JSON 저장
+      user_id
     }]).select();
 
     if (error) throw error;
@@ -606,6 +633,84 @@ app.post('/api/modify-trip', async (req, res) => {
   }
 });
 
+// --- [API 3.5] 장소 이미지 프록시 (New) ---
+app.get('/api/place-image', async (req, res) => {
+  const { query } = req.query;
+  // ✨ [Fix] Prevent browser caching of redirects (especially fallbacks) so retries happen
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+
+  if (!query) return res.redirect("https://images.unsplash.com/photo-1476514525535-07fb3b4ae5f1?q=80&w=800&auto=format&fit=crop");
+
+  try {
+    // 1. 캐시 확인 (간단한 인메모리 캐시 활용)
+    // 참고: 실제 프로덕션에서는 Redis 등을 사용하거나, fetchPlaceDetails 내부 캐시를 활용해야 함.
+    // 여기서는 fetchNaverImage를 직접 호출하되, 추후 최적화 가능.
+
+    // 2. 네이버 이미지 검색
+    const imageUrl = await fetchNaverImage(query);
+
+    if (imageUrl) {
+      return res.redirect(imageUrl);
+    }
+
+    // 3. [Fallback] Google Places Photo
+    try {
+      console.log(`⚠️ Naver failed for ${query}, trying Google Places Fallback...`);
+      const googleRes = await axios.post(
+        `https://places.googleapis.com/v1/places:searchText`,
+        { textQuery: query },
+        {
+          headers: {
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
+            "X-Goog-FieldMask": "places.photos"
+          }
+        }
+      );
+
+      const place = googleRes.data.places && googleRes.data.places[0];
+      if (place && place.photos && place.photos.length > 0) {
+        const googlePhotoUrl = `${SERVER_BASE_URL}/api/proxy/google-photo/${place.photos[0].name}`;
+        return res.redirect(googlePhotoUrl);
+      }
+    } catch (googleError) {
+      console.error("Google Fallback Error:", googleError.message);
+    }
+
+    // 4. 실패 시 기본 이미지
+    return res.redirect(FALLBACK_IMAGE_URL);
+
+  } catch (error) {
+    console.error("Image Proxy Error:", error);
+    return res.redirect(FALLBACK_IMAGE_URL);
+  }
+});
+
+// --- [API 3.6] Google Photo Proxy (Secure) ---
+// [Fix] Use Regex route to avoid string parsing issues with special characters
+app.get(/\/api\/proxy\/google-photo\/(.*)/, async (req, res) => {
+  const photoName = req.params[0];
+  if (!photoName) return res.status(400).send("No photo name provided");
+
+  try {
+    const photoUrl = `https://places.googleapis.com/v1/${photoName}/media?maxHeightPx=800&maxWidthPx=800&key=${GOOGLE_MAPS_API_KEY}`;
+
+    const response = await axios({
+      method: 'get',
+      url: photoUrl,
+      responseType: 'stream'
+    });
+
+    res.setHeader('Content-Type', response.headers['content-type']);
+    res.setHeader('Cache-Control', 'public, max-age=86400'); // Cache for 1 day
+    response.data.pipe(res);
+
+  } catch (error) {
+    console.error("Google Photo Proxy Error:", error.message);
+    res.redirect(FALLBACK_IMAGE_URL);
+  }
+});
+
 // --- [API 3] 자동완성 (New API + 도시 필터링) ---
 app.get('/api/places/autocomplete', async (req, res) => {
   const { query } = req.query;
@@ -619,7 +724,7 @@ app.get('/api/places/autocomplete', async (req, res) => {
       {
         input: query,
         languageCode: "ko",
-        includedPrimaryTypes: ["locality", "administrative_area_level_1"]
+        includedPrimaryTypes: ["locality", "administrative_area_level_1", "administrative_area_level_2", "country"]
       },
       {
         headers: {
@@ -637,18 +742,21 @@ app.get('/api/places/autocomplete', async (req, res) => {
       main_text: item.placePrediction.structuredFormat?.mainText?.text || item.placePrediction.text.text
     }));
 
-    // [Fix] 정렬 로직 개선:
-    // 1순위: Secondary Text가 단순한 것 (예: "미국" vs "미국 아이오와") - 주요 도시/주 우선
-    // 2순위: 이름 길이가 짧은 것 (정확도)
-    predictions.sort((a, b) => {
-      const aHasComplexSecondary = a.secondary_text.includes(' ');
-      const bHasComplexSecondary = b.secondary_text.includes(' ');
+    // [Fix] 정렬 로직 제거 (Google API 순서 신뢰) 및 필터링 완화
+    // 기존 로직이 '부산'보다 '부산광역시'를 뒤로 보내는 등 부자연스러운 결과 초래
+    // predictions.sort((a, b) => ... ); 
 
-      if (aHasComplexSecondary !== bHasComplexSecondary) {
-        return aHasComplexSecondary ? 1 : -1; // 단순한 것이 위로
-      }
-      return a.description.length - b.description.length; // 길이 짧은 순
-    });
+    // [Fix] Prioritize Korean results if query contains Korean
+    const isKoreanQuery = /[가-힣]/.test(query);
+    if (isKoreanQuery) {
+      predictions.sort((a, b) => {
+        const aIsKorea = a.description.includes("대한민국") || a.description.includes("South Korea");
+        const bIsKorea = b.description.includes("대한민국") || b.description.includes("South Korea");
+        if (aIsKorea && !bIsKorea) return -1;
+        if (!aIsKorea && bIsKorea) return 1;
+        return 0;
+      });
+    }
 
     res.status(200).json({ predictions: predictions });
 
