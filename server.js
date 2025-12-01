@@ -9,6 +9,9 @@ const app = express();
 // Render 배포 환경 호환
 const PORT = process.env.PORT || 8080;
 
+// Helper function for delay
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 // 대용량 데이터 처리를 위해 limit 설정 증가
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
@@ -690,25 +693,7 @@ app.get('/api/place-image', async (req, res) => {
 // [Fix] Use Regex route to avoid string parsing issues with special characters
 app.get(/\/api\/proxy\/google-photo\/(.*)/, async (req, res) => {
   const photoName = req.params[0];
-  if (!photoName) return res.status(400).send("No photo name provided");
-
-  try {
-    const photoUrl = `https://places.googleapis.com/v1/${photoName}/media?maxHeightPx=800&maxWidthPx=800&key=${GOOGLE_MAPS_API_KEY}`;
-
-    const response = await axios({
-      method: 'get',
-      url: photoUrl,
-      responseType: 'stream'
-    });
-
-    res.setHeader('Content-Type', response.headers['content-type']);
-    res.setHeader('Cache-Control', 'public, max-age=86400'); // Cache for 1 day
-    response.data.pipe(res);
-
-  } catch (error) {
-    console.error("Google Photo Proxy Error:", error.message);
-    res.redirect(FALLBACK_IMAGE_URL);
-  }
+  res.redirect(FALLBACK_IMAGE_URL);
 });
 
 // --- [API 3] 자동완성 (New API + 도시 필터링) ---
