@@ -511,37 +511,12 @@ app.post('/api/generate-trip', async (req, res) => {
       }
     }
 
-    // ✨ [Optimization] 1-Shot Strategy: Gemini가 생성한 'cover_image_query' 사용
-    const artisticQuery = itineraryJson.cover_image_query || `${destination} travel`;
-    console.log(`🎨 AI Art Prompt (from JSON): ${artisticQuery}`);
+    // ✨ [Optimization] Text-Based Cover Image (Korean Region Name Only)
+    const koreanRegion = await getKoreanRegionName(destination);
+    const coverImageUrl = `${SERVER_BASE_URL}/api/text-cover?text=${encodeURIComponent(koreanRegion)}`;
+    console.log(`🎨 Generated Text Cover: ${coverImageUrl} (from ${destination})`);
 
-    // 1순위: AI 프롬프트로 네이버 이미지 검색
-    let bestCoverImage = await fetchNaverImage(artisticQuery);
-
-    // 2순위: 실패 시, 기존 로직 (관광지 사진 or Fallback)
-    if (!bestCoverImage) {
-      let fallbackImage = null;
-
-      for (const day of itineraryJson.itinerary) {
-        for (const act of day.activities) {
-          if (act.photoUrl) {
-            // 1순위: 관광지 사진
-            if (act.types && act.types.includes('tourist_attraction')) {
-              bestCoverImage = act.photoUrl;
-              break; // 찾았으면 루프 종료
-            }
-            // 2순위: 아무 사진이나 (백업용)
-            if (!fallbackImage) fallbackImage = act.photoUrl;
-          }
-        }
-        if (bestCoverImage) break;
-      }
-      // 관광지 사진이 없으면 백업 사진 사용
-      if (!bestCoverImage) bestCoverImage = fallbackImage;
-    }
-
-    // 관광지 사진이 없으면 백업 사진 사용, 그것도 없으면 Unsplash/고정 이미지 사용은 프론트에서 처리
-    itineraryJson.cover_image = bestCoverImage || null;
+    itineraryJson.cover_image = coverImageUrl;
 
     const { data, error } = await supabase.from('trip_plans').insert([{
       destination, duration: `${startDate} ~ ${endDate}`,
@@ -770,12 +745,18 @@ app.get('/api/places/autocomplete', async (req, res) => {
   if (!query) return res.status(200).json({ predictions: [] });
 
   try {
+    // [Refinement] Limit granularity globally to Country, Level 1 (Do/State), Level 2 (Si/County).
+    // User requested "3rd largest administrative district" (Country -> Do -> Si).
+    // Note: This excludes 'locality' (City) which might affect some US cities, but strictly follows the "3rd level" rule.
+    // If US cities like "Los Angeles" disappear (showing only County), we might need to re-add 'locality'.
+    const primaryTypes = ["administrative_area_level_1", "administrative_area_level_2", "country"];
+
     const response = await axios.post(
       `https://places.googleapis.com/v1/places:autocomplete`,
       {
         input: query,
         languageCode: "ko",
-        includedPrimaryTypes: ["locality", "administrative_area_level_1", "administrative_area_level_2", "country"]
+        includedPrimaryTypes: primaryTypes
       },
       {
         headers: {
@@ -1032,6 +1013,66 @@ app.put('/api/admin/user/tier', async (req, res) => {
   }
 });
 
+// --- [API 10.5] 표지 사진 일괄 업데이트 (Admin) ---
+app.post('/api/admin/update-covers', async (req, res) => {
+  const { secret_key } = req.body;
+  // 간단한 보안 키 확인 (실제 운영 시에는 더 강력한 보안 필요)
+  if (secret_key !== process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY && secret_key !== "admin_secret") {
+    return res.status(403).json({ error: "Unauthorized" });
+  }
+
+  try {
+    console.log("🔄 Starting Batch Cover Image Update...");
+
+    // 1. 모든 여행 일정 가져오기
+    const { data: trips, error } = await supabase
+      .from('trip_plans')
+      .select('id, destination, itinerary_data')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    let updatedCount = 0;
+    const results = [];
+
+    // 2. 순차적으로 업데이트 (Rate Limit 방지)
+    for (const trip of trips) {
+      const { id, destination, itinerary_data } = trip;
+
+      // 이미 좋은 이미지가 있는지 확인 (선택 사항: 강제 업데이트 플래그 추가 가능)
+      // 여기서는 무조건 업데이트하거나, 특정 조건(예: unsplash)일 때만 업데이트하도록 설정 가능
+      // 현재는 "기존 이미지 갱신" 요청이므로 모든 항목에 대해 시도합니다.
+
+      // Text-Based Cover Image Update (Korean Region Name Only)
+      const koreanRegion = await getKoreanRegionName(destination);
+      const newImage = `${SERVER_BASE_URL}/api/text-cover?text=${encodeURIComponent(koreanRegion)}`;
+      console.log(`🖼️ Updating Trip ${id} (${destination}) -> ${newImage}`);
+
+      // JSON 데이터 업데이트
+      itinerary_data.cover_image = newImage;
+
+      // DB 저장
+      await supabase
+        .from('trip_plans')
+        .update({ itinerary_data: itinerary_data })
+        .eq('id', id);
+
+      updatedCount++;
+      results.push({ id, destination, status: "updated", image: newImage });
+
+      // 딜레이 (0.1초 - 텍스트 생성은 빠르므로 짧게)
+      await delay(100);
+    }
+
+    console.log(`✅ Batch Update Completed. Updated: ${updatedCount}/${trips.length}`);
+    res.status(200).json({ success: true, updatedCount, total: trips.length, results });
+
+  } catch (error) {
+    console.error("Batch Update Error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // --- [API 11] 건의사항 삭제 ---
 app.delete('/api/board/:id', async (req, res) => {
   const { id } = req.params;
@@ -1059,6 +1100,70 @@ app.delete('/api/board/:id', async (req, res) => {
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
+});
+
+// Helper: Extract Korean Region Name using Gemini (Cheap & Accurate)
+async function getKoreanRegionName(destination) {
+  try {
+    const prompt = `
+      Extract only the core city/region name in Korean from: "${destination}".
+      - Remove country name (e.g., "South Korea", "Japan", "USA", "United States", "대한민국", "미국").
+      - If English, translate to Korean (e.g., "Tokyo" -> "도쿄", "New York" -> "뉴욕").
+      - **[IMPORTANT] Remove administrative suffixes & State names:**
+        - "서울특별시" -> "서울", "부산광역시" -> "부산", "제주특별자치도" -> "제주"
+        - "도쿄도" -> "도쿄", "오사카부" -> "오사카"
+        - "New York, NY" -> "뉴욕" (Remove state abbreviation)
+        - "Los Angeles, California" -> "로스앤젤레스" (Remove state name)
+        - "Las Vegas, NV" -> "라스베이거스"
+        - "시", "군", "구", "주" (State) suffix removal if it makes sense.
+      - Output ONLY the clean name (no extra text).
+    `;
+    const result = await model.generateContent({
+      contents: [{ role: "user", parts: [{ text: prompt }] }]
+    });
+    const text = result.response.text().trim();
+    // Remove any accidental quotes or markdown
+    return text.replace(/["'`*]/g, "").trim();
+  } catch (e) {
+    console.error("Translation Error:", e);
+    // Fallback: simple string cleaning
+    return destination.split(',')[0].trim().replace(/[시군구도주]$/, '');
+  }
+}
+
+// --- [API 13] Text Cover Image Generator (SVG) ---
+app.get('/api/text-cover', (req, res) => {
+  const { text } = req.query;
+  const displayText = text || "TripGen";
+
+  // Deterministic Color Generation based on text
+  let hash = 0;
+  for (let i = 0; i < displayText.length; i++) {
+    hash = displayText.charCodeAt(i) + ((hash << 5) - hash);
+  }
+
+  const c1 = (hash & 0x00FFFFFF).toString(16).toUpperCase();
+  const c2 = ((hash * 123) & 0x00FFFFFF).toString(16).toUpperCase();
+  const color1 = "#" + "00000".substring(0, 6 - c1.length) + c1;
+  const color2 = "#" + "00000".substring(0, 6 - c2.length) + c2;
+
+  const svg = `
+    <svg width="800" height="600" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" style="stop-color:${color1};stop-opacity:1" />
+          <stop offset="100%" style="stop-color:${color2};stop-opacity:1" />
+        </linearGradient>
+      </defs>
+      <rect width="100%" height="100%" fill="url(#grad)" />
+      <text x="50%" y="50%" font-family="Arial, sans-serif" font-size="60" font-weight="bold" fill="white" text-anchor="middle" dominant-baseline="middle" style="text-shadow: 2px 2px 4px rgba(0,0,0,0.5);">
+        ${displayText}
+      </text>
+    </svg>
+  `;
+
+  res.setHeader('Content-Type', 'image/svg+xml');
+  res.send(svg);
 });
 
 app.listen(PORT, () => {
