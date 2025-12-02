@@ -33,7 +33,7 @@ const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 const ADMIN_EMAIL = process.env.NEXT_PUBLIC_ADMIN_EMAIL;
 const SERVER_BASE_URL = process.env.SERVER_BASE_URL || "http://localhost:8080";
 
-const TIER_LIMITS = { free: 3, pro: 30, admin: Infinity };
+const TIER_LIMITS = { free: 5, pro: 30, admin: Infinity };
 const FALLBACK_IMAGE_URL = "https://images.unsplash.com/photo-1476514525535-07fb3b4ae5f1?q=80&w=800&auto=format&fit=crop";
 
 const FALLBACK_IMAGES = {
@@ -377,17 +377,13 @@ app.post('/api/generate-trip', async (req, res) => {
       userLimit = resetData || { ...userLimit, usage_count: 0 };
     }
 
-    // [Server-Side Limit Check with Ad Credits]
+    // [Server-Side Limit Check]
     const limit = TIER_LIMITS[userLimit.tier] || 3;
-    const adCredits = userLimit.ad_credits || 0;
-    const totalAllowed = limit + adCredits;
 
-    if (userLimit.tier !== 'admin' && userLimit.usage_count >= totalAllowed) {
+    if (userLimit.tier !== 'admin' && userLimit.usage_count >= limit) {
       return res.status(403).json({
         error: "월간 생성 한도를 초과했습니다.",
-        baseLimit: limit,
-        adCredits: adCredits,
-        canEarnMore: true
+        baseLimit: limit
       });
     }
 
@@ -416,7 +412,11 @@ app.post('/api/generate-trip', async (req, res) => {
       4. **데이터:** photoUrl 등 상세 정보 제외.
 
       [출력 JSON]
-      { "trip_title": "제목", "itinerary": [ { "day": 1, "date": "YYYY-MM-DD", "activities": [ { "time": "HH:MM", "place_name": "장소명", "type": "관광/식사/숙소", "activity_description": "설명", "is_booking_required": true/false } ] } ] }
+      { 
+        "trip_title": "제목", 
+        "cover_image_query": "Short English artistic image search query for this trip (e.g., 'Kyoto zen garden watercolor')",
+        "itinerary": [ { "day": 1, "date": "YYYY-MM-DD", "activities": [ { "time": "HH:MM", "place_name": "장소명", "type": "관광/식사/숙소", "activity_description": "설명", "is_booking_required": true/false } ] } ] 
+      }
     `;
 
     const result = await model.generateContent({
@@ -511,43 +511,50 @@ app.post('/api/generate-trip', async (req, res) => {
       }
     }
 
-    // ✨ [New] 대표 이미지(Cover Image) 선정 로직
-    // 전체 일정 중 'tourist_attraction' 타입이면서 사진이 있는 곳을 찾음
-    let bestCoverImage = null;
-    let fallbackImage = null;
+    // ✨ [Optimization] 1-Shot Strategy: Gemini가 생성한 'cover_image_query' 사용
+    const artisticQuery = itineraryJson.cover_image_query || `${destination} travel`;
+    console.log(`🎨 AI Art Prompt (from JSON): ${artisticQuery}`);
 
-    for (const day of itineraryJson.itinerary) {
-      for (const act of day.activities) {
-        if (act.photoUrl) {
-          // 1순위: 관광지 사진
-          if (act.types && act.types.includes('tourist_attraction')) {
-            bestCoverImage = act.photoUrl;
-            break; // 찾았으면 루프 종료
+    // 1순위: AI 프롬프트로 네이버 이미지 검색
+    let bestCoverImage = await fetchNaverImage(artisticQuery);
+
+    // 2순위: 실패 시, 기존 로직 (관광지 사진 or Fallback)
+    if (!bestCoverImage) {
+      let fallbackImage = null;
+
+      for (const day of itineraryJson.itinerary) {
+        for (const act of day.activities) {
+          if (act.photoUrl) {
+            // 1순위: 관광지 사진
+            if (act.types && act.types.includes('tourist_attraction')) {
+              bestCoverImage = act.photoUrl;
+              break; // 찾았으면 루프 종료
+            }
+            // 2순위: 아무 사진이나 (백업용)
+            if (!fallbackImage) fallbackImage = act.photoUrl;
           }
-          // 2순위: 아무 사진이나 (백업용)
-          if (!fallbackImage) fallbackImage = act.photoUrl;
         }
+        if (bestCoverImage) break;
       }
-      if (bestCoverImage) break;
+      // 관광지 사진이 없으면 백업 사진 사용
+      if (!bestCoverImage) bestCoverImage = fallbackImage;
     }
 
     // 관광지 사진이 없으면 백업 사진 사용, 그것도 없으면 Unsplash/고정 이미지 사용은 프론트에서 처리
-    itineraryJson.cover_image = bestCoverImage || fallbackImage || null;
+    itineraryJson.cover_image = bestCoverImage || null;
 
     const { data, error } = await supabase.from('trip_plans').insert([{
       destination, duration: `${startDate} ~ ${endDate}`,
       style: "맞춤 여행", companions: "제한 없음",
-      itinerary_data: itineraryJson, // cover_image가 포함된 JSON 저장
+      itinerary_data: itineraryJson,
       user_id
     }]).select();
 
     if (error) throw error;
 
-    // Update usage count and decrement ad_credits if using bonus credits
-    const usedAdCredit = userLimit.usage_count >= limit && adCredits > 0;
+    // Update usage count
     await supabase.from('user_limits').update({
-      usage_count: userLimit.usage_count + 1,
-      ...(usedAdCredit ? { ad_credits: adCredits - 1 } : {})
+      usage_count: userLimit.usage_count + 1
     }).eq('user_id', user_id);
 
     res.status(200).json({ success: true, data: data[0] });
@@ -701,7 +708,7 @@ app.get('/api/place-image', async (req, res) => {
   // ✨ [Fix] Prevent browser caching of redirects (especially fallbacks) so retries happen
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
 
-  if (!query) return res.redirect("https://images.unsplash.com/photo-1476514525535-07fb3b4ae5f1?q=80&w=800&auto=format&fit=crop");
+  if (!query) return res.redirect(FALLBACK_IMAGE_URL);
 
   try {
     // 1. 캐시 확인 (간단한 인메모리 캐시 활용)
@@ -861,40 +868,7 @@ app.post('/api/board', async (req, res) => {
   }
 });
 
-// --- [API 6] 광고 리워드 적립 ---
-app.post('/api/ad/redeem', async (req, res) => {
-  const { user_id } = req.body;
-  if (!user_id) return res.status(400).json({ error: "User ID Required" });
 
-  try {
-    const today = new Date().toISOString().split('T')[0];
-    let { data: userLimit } = await supabase.from('user_limits').select('*').eq('user_id', user_id).single();
-
-    if (!userLimit) return res.status(404).json({ error: "User not found" });
-
-    const lastAdDate = userLimit.last_ad_watch_date ? new Date(userLimit.last_ad_watch_date).toISOString().split('T')[0] : null;
-    let dailyCount = userLimit.daily_ad_count || 0;
-
-    if (lastAdDate !== today) {
-      dailyCount = 0;
-    }
-
-    if (dailyCount >= 2) {
-      return res.status(403).json({ error: "일일 광고 시청 한도 초과 (최대 2회)" });
-    }
-
-    await supabase.from('user_limits').update({
-      ad_credits: (userLimit.ad_credits || 0) + 1,
-      daily_ad_count: dailyCount + 1,
-      last_ad_watch_date: new Date()
-    }).eq('user_id', user_id);
-
-    res.status(200).json({ success: true, credits: (userLimit.ad_credits || 0) + 1, dailyRemaining: 2 - dailyCount });
-  } catch (error) {
-    console.error("Redeem Ad Credit Error:", error);
-    res.status(500).json({ error: "크레딧 획득 실패" });
-  }
-});
 
 app.get('/api/public/trip/:id', async (req, res) => {
   const { id } = req.params;
@@ -1028,7 +1002,7 @@ app.get('/api/admin/users', async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('user_limits')
-      .select('user_id, tier, usage_count, ad_credits')
+      .select('user_id, tier, usage_count')
       .order('usage_count', { ascending: false });
 
     if (error) throw error;
@@ -1084,42 +1058,6 @@ app.delete('/api/board/:id', async (req, res) => {
     res.status(200).json({ success: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
-  }
-});
-
-// --- [API 12] 광고 리워드 (Alias) ---
-app.post('/api/redeem-ad-credit', async (req, res) => {
-  // 기존 /api/ad/redeem 로직 재사용
-  const { user_id } = req.body;
-  if (!user_id) return res.status(400).json({ error: "User ID Required" });
-
-  try {
-    const today = new Date().toISOString().split('T')[0];
-    let { data: userLimit } = await supabase.from('user_limits').select('*').eq('user_id', user_id).single();
-
-    if (!userLimit) return res.status(404).json({ error: "User not found" });
-
-    const lastAdDate = userLimit.last_ad_watch_date ? new Date(userLimit.last_ad_watch_date).toISOString().split('T')[0] : null;
-    let dailyCount = userLimit.daily_ad_count || 0;
-
-    if (lastAdDate !== today) {
-      dailyCount = 0;
-    }
-
-    if (dailyCount >= 2) {
-      return res.status(403).json({ error: "일일 광고 시청 한도 초과 (최대 2회)" });
-    }
-
-    await supabase.from('user_limits').update({
-      ad_credits: (userLimit.ad_credits || 0) + 1,
-      daily_ad_count: dailyCount + 1,
-      last_ad_watch_date: new Date()
-    }).eq('user_id', user_id);
-
-    res.status(200).json({ success: true, credits: (userLimit.ad_credits || 0) + 1, dailyRemaining: 2 - dailyCount });
-  } catch (error) {
-    console.error("Redeem Ad Credit Error:", error);
-    res.status(500).json({ error: "크레딧 획득 실패" });
   }
 });
 
