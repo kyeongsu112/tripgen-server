@@ -760,390 +760,383 @@ app.get('/api/place-image', async (req, res) => {
   }
 });
 
-// --- [API 3.6] Google Photo Proxy (Secure) ---
+// --- [API 3.6] Google Photo Proxy REMOVED (Cost Saving) ---
 // Proxies the image data from Google Places Media API
 app.get(/\/api\/proxy\/google-photo\/(.*)/, async (req, res) => {
-  const photoName = req.params[0]; // will be "places/PLACE_ID/photos/PHOTO_ID"
+  // Logic removed to save costs
+  return res.redirect(FALLBACK_IMAGE_URL);
+});
 
-  if (!photoName) return res.redirect(FALLBACK_IMAGE_URL);
+// --- [API 3] 자동완성 (New API + 도시 필터링) ---
+app.get('/api/places/autocomplete', async (req, res) => {
+  const { query } = req.query;
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
 
-  // --- [API 3.6] Google Photo Proxy REMOVED (Cost Saving) ---
-  // Proxies the image data from Google Places Media API
-  app.get(/\/api\/proxy\/google-photo\/(.*)/, async (req, res) => {
-    // Logic removed to save costs
-    return res.redirect(FALLBACK_IMAGE_URL);
-  });
+  if (!query) return res.status(200).json({ predictions: [] });
 
-  // --- [API 3] 자동완성 (New API + 도시 필터링) ---
-  app.get('/api/places/autocomplete', async (req, res) => {
-    const { query } = req.query;
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  try {
+    // [Refinement] Limit granularity globally to Country, Level 1 (Do/State), Level 2 (Si/County), and Locality (City).
+    // We MUST include 'locality' because major cities like "Las Vegas", "Paris", "London" are localities.
+    // We exclude 'sublocality' and 'neighborhood' to avoid small districts (Dong/Eup/Myeon).
+    const primaryTypes = ["locality", "administrative_area_level_1", "administrative_area_level_2", "country"];
 
-    if (!query) return res.status(200).json({ predictions: [] });
-
-    try {
-      // [Refinement] Limit granularity globally to Country, Level 1 (Do/State), Level 2 (Si/County), and Locality (City).
-      // We MUST include 'locality' because major cities like "Las Vegas", "Paris", "London" are localities.
-      // We exclude 'sublocality' and 'neighborhood' to avoid small districts (Dong/Eup/Myeon).
-      const primaryTypes = ["locality", "administrative_area_level_1", "administrative_area_level_2", "country"];
-
-      const response = await axios.post(
-        `https://places.googleapis.com/v1/places:autocomplete`,
-        {
-          input: query,
-          languageCode: "ko",
-          includedPrimaryTypes: primaryTypes
-        },
-        {
-          headers: {
-            "Content-Type": "application/json",
-            "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY
-          }
+    const response = await axios.post(
+      `https://places.googleapis.com/v1/places:autocomplete`,
+      {
+        input: query,
+        languageCode: "ko",
+        includedPrimaryTypes: primaryTypes
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY
         }
-      );
-
-      const suggestions = response.data.suggestions || [];
-      let predictions = suggestions.map(item => ({
-        description: item.placePrediction.text.text,
-        place_id: item.placePrediction.placeId,
-        secondary_text: item.placePrediction.structuredFormat?.secondaryText?.text || "",
-        main_text: item.placePrediction.structuredFormat?.mainText?.text || item.placePrediction.text.text
-      }));
-
-      // [Fix] 정렬 로직 제거 (Google API 순서 신뢰) 및 필터링 완화
-      // 기존 로직이 '부산'보다 '부산광역시'를 뒤로 보내는 등 부자연스러운 결과 초래
-      // predictions.sort((a, b) => ... ); 
-
-      // [Fix] Prioritize Korean results if query contains Korean
-      const isKoreanQuery = /[가-힣]/.test(query);
-      if (isKoreanQuery) {
-        predictions.sort((a, b) => {
-          const aIsKorea = a.description.includes("대한민국") || a.description.includes("South Korea");
-          const bIsKorea = b.description.includes("대한민국") || b.description.includes("South Korea");
-          if (aIsKorea && !bIsKorea) return -1;
-          if (!aIsKorea && bIsKorea) return 1;
-          return 0;
-        });
       }
+    );
 
-      res.status(200).json({ predictions: predictions });
+    const suggestions = response.data.suggestions || [];
+    let predictions = suggestions.map(item => ({
+      description: item.placePrediction.text.text,
+      place_id: item.placePrediction.placeId,
+      secondary_text: item.placePrediction.structuredFormat?.secondaryText?.text || "",
+      main_text: item.placePrediction.structuredFormat?.mainText?.text || item.placePrediction.text.text
+    }));
 
-    } catch (error) {
-      console.error("Autocomplete Error:", error.response?.data || error.message);
-      res.status(200).json({ predictions: [] });
+    // [Fix] 정렬 로직 제거 (Google API 순서 신뢰) 및 필터링 완화
+    // 기존 로직이 '부산'보다 '부산광역시'를 뒤로 보내는 등 부자연스러운 결과 초래
+    // predictions.sort((a, b) => ... ); 
+
+    // [Fix] Prioritize Korean results if query contains Korean
+    const isKoreanQuery = /[가-힣]/.test(query);
+    if (isKoreanQuery) {
+      predictions.sort((a, b) => {
+        const aIsKorea = a.description.includes("대한민국") || a.description.includes("South Korea");
+        const bIsKorea = b.description.includes("대한민국") || b.description.includes("South Korea");
+        if (aIsKorea && !bIsKorea) return -1;
+        if (!aIsKorea && bIsKorea) return 1;
+        return 0;
+      });
     }
-  });
 
-  // --- [API 4] 회원 탈퇴 ---
-  app.delete('/api/auth/delete', async (req, res) => {
-    const { user_id, email } = req.body;
-    if (!user_id) return res.status(400).json({ error: "User ID Required" });
+    res.status(200).json({ predictions: predictions });
 
-    try {
-      if (email) {
-        await supabase.from('deleted_users').insert([{ email: email }]);
-      }
-      await supabase.from('trip_plans').delete().eq('user_id', user_id);
-      await supabase.from('user_limits').delete().eq('user_id', user_id);
-      await supabase.from('suggestions').delete().eq('user_id', user_id);
-      await supabase.from('community').delete().eq('user_id', user_id);
+  } catch (error) {
+    console.error("Autocomplete Error:", error.response?.data || error.message);
+    res.status(200).json({ predictions: [] });
+  }
+});
 
-      const { error: deleteError } = await supabaseAdmin.auth.admin.deleteUser(user_id);
-      if (deleteError) throw deleteError;
+// --- [API 4] 회원 탈퇴 ---
+app.delete('/api/auth/delete', async (req, res) => {
+  const { user_id, email } = req.body;
+  if (!user_id) return res.status(400).json({ error: "User ID Required" });
 
-      res.status(200).json({ success: true, message: "회원 탈퇴 완료" });
-    } catch (error) {
-      res.status(500).json({ error: "탈퇴 처리 중 오류" });
+  try {
+    if (email) {
+      await supabase.from('deleted_users').insert([{ email: email }]);
     }
-  });
+    await supabase.from('trip_plans').delete().eq('user_id', user_id);
+    await supabase.from('user_limits').delete().eq('user_id', user_id);
+    await supabase.from('suggestions').delete().eq('user_id', user_id);
+    await supabase.from('community').delete().eq('user_id', user_id);
 
-  // --- [API 5] 건의사항 게시판 ---
-  app.get('/api/board', async (req, res) => {
-    try {
-      const { data, error } = await supabase.from('suggestions').select('*').order('created_at', { ascending: false });
-      if (error) throw error;
-      res.status(200).json({ success: true, data });
-    } catch (error) {
-      res.status(500).json({ error: error.message });
+    const { error: deleteError } = await supabaseAdmin.auth.admin.deleteUser(user_id);
+    if (deleteError) throw deleteError;
+
+    res.status(200).json({ success: true, message: "회원 탈퇴 완료" });
+  } catch (error) {
+    res.status(500).json({ error: "탈퇴 처리 중 오류" });
+  }
+});
+
+// --- [API 5] 건의사항 게시판 ---
+app.get('/api/board', async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('suggestions').select('*').order('created_at', { ascending: false });
+    if (error) throw error;
+    res.status(200).json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/board', async (req, res) => {
+  const { user_id, email, content } = req.body;
+  if (!content) return res.status(400).json({ error: "내용 부족" });
+
+  try {
+    const { data, error } = await supabase.from('suggestions').insert([{
+      user_id: user_id || null,
+      email: email || '익명',
+      content
+    }]).select();
+    if (error) throw error;
+    res.status(200).json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+app.get('/api/public/trip/:id', async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const { data, error } = await supabase
+      .from('trip_plans')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (error) {
+      console.error('Public trip fetch error:', error);
+      return res.status(404).json({ success: false, error: '일정을 찾을 수 없습니다.' });
     }
-  });
 
-  app.post('/api/board', async (req, res) => {
-    const { user_id, email, content } = req.body;
-    if (!content) return res.status(400).json({ error: "내용 부족" });
-
-    try {
-      const { data, error } = await supabase.from('suggestions').insert([{
-        user_id: user_id || null,
-        email: email || '익명',
-        content
-      }]).select();
-      if (error) throw error;
-      res.status(200).json({ success: true, data });
-    } catch (error) {
-      res.status(500).json({ error: error.message });
+    if (!data) {
+      return res.status(404).json({ success: false, error: '일정을 찾을 수 없습니다.' });
     }
-  });
 
+    res.status(200).json({ success: true, data });
+  } catch (error) {
+    console.error('Public trip error:', error);
+    res.status(500).json({ success: false, error: '서버 오류가 발생했습니다.' });
+  }
+});
 
+// --- [API 7] 내 여행 목록 조회 ---
+app.get('/api/my-trips', async (req, res) => {
+  const { user_id } = req.query;
+  if (!user_id) return res.status(400).json({ error: "User ID Required" });
 
-  app.get('/api/public/trip/:id', async (req, res) => {
-    const { id } = req.params;
+  try {
+    const { data, error } = await supabase
+      .from('trip_plans')
+      .select('*')
+      .eq('user_id', user_id)
+      .order('created_at', { ascending: false });
 
-    try {
-      const { data, error } = await supabase
+    if (error) throw error;
+    res.status(200).json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- [API 8] 여행 일정 삭제 ---
+app.delete('/api/trip/:id', async (req, res) => {
+  const { id } = req.params;
+  const { user_id } = req.body;
+
+  if (!user_id) return res.status(400).json({ error: "User ID Required" });
+
+  try {
+    const { error } = await supabase
+      .from('trip_plans')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', user_id);
+
+    if (error) throw error;
+    res.status(200).json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- [API 9] 커뮤니티 게시판 ---
+app.get('/api/community', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('community')
+      .select('*')
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.status(200).json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/community', async (req, res) => {
+  const { user_id, email, nickname, content, is_anonymous } = req.body;
+  if (!content) return res.status(400).json({ error: "내용이 필요합니다" });
+
+  try {
+    const { data, error } = await supabase.from('community').insert([{
+      user_id: user_id || null,
+      email: email || '익명',
+      nickname: nickname || '익명',
+      content,
+      is_anonymous: is_anonymous || false
+    }]).select();
+    if (error) throw error;
+    res.status(200).json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/community/:id', async (req, res) => {
+  const { id } = req.params;
+  const { user_id, email } = req.body;
+
+  try {
+    const { data: post } = await supabase
+      .from('community')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (!post) return res.status(404).json({ error: "게시글을 찾을 수 없습니다" });
+
+    const isOwner = user_id && post.user_id === user_id;
+    const isAdmin = email === ADMIN_EMAIL;
+
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({ error: "삭제 권한이 없습니다" });
+    }
+
+    const { error } = await supabase.from('community').delete().eq('id', id);
+    if (error) throw error;
+    res.status(200).json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- [API 10] 관리자 페이지 ---
+app.get('/api/admin/users', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('user_limits')
+      .select('user_id, tier, usage_count')
+      .order('usage_count', { ascending: false });
+
+    if (error) throw error;
+    res.status(200).json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/admin/user/tier', async (req, res) => {
+  const { target_user_id, new_tier } = req.body;
+
+  if (!target_user_id || !new_tier) {
+    return res.status(400).json({ error: "필수 정보가 누락되었습니다" });
+  }
+
+  try {
+    const { error } = await supabase
+      .from('user_limits')
+      .update({ tier: new_tier })
+      .eq('user_id', target_user_id);
+
+    if (error) throw error;
+    res.status(200).json({ success: true, message: "등급이 변경되었습니다" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- [API 10.5] 표지 사진 일괄 업데이트 (Admin) ---
+app.post('/api/admin/update-covers', async (req, res) => {
+  const { secret_key } = req.body;
+  // 간단한 보안 키 확인 (실제 운영 시에는 더 강력한 보안 필요)
+  if (secret_key !== process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY && secret_key !== "admin_secret") {
+    return res.status(403).json({ error: "Unauthorized" });
+  }
+
+  try {
+    console.log("🔄 Starting Batch Cover Image Update...");
+
+    // 1. 모든 여행 일정 가져오기
+    const { data: trips, error } = await supabase
+      .from('trip_plans')
+      .select('id, destination, itinerary_data')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    let updatedCount = 0;
+    const results = [];
+
+    // 2. 순차적으로 업데이트 (Rate Limit 방지)
+    for (const trip of trips) {
+      const { id, destination, itinerary_data } = trip;
+
+      // 이미 좋은 이미지가 있는지 확인 (선택 사항: 강제 업데이트 플래그 추가 가능)
+      // 여기서는 무조건 업데이트하거나, 특정 조건(예: unsplash)일 때만 업데이트하도록 설정 가능
+      // 현재는 "기존 이미지 갱신" 요청이므로 모든 항목에 대해 시도합니다.
+
+      // Text-Based Cover Image Update -> SWITCHED TO "Null" for Dynamic Fetch
+      // Old: const koreanRegion = await getKoreanRegionName(destination);
+      // Old: const newImage = `${SERVER_BASE_URL}/api/text-cover?text=${encodeURIComponent(koreanRegion)}`;
+
+      const newImage = null; // Let frontend fetch dynamically via getTripCoverImage
+      console.log(`🖼️ Updating Trip ${id} (${destination}) -> NULL (Dynamic Fetch Enabled)`);
+
+      // JSON 데이터 업데이트
+      itinerary_data.cover_image = newImage;
+
+      // DB 저장
+      await supabase
         .from('trip_plans')
-        .select('*')
-        .eq('id', id)
-        .single();
+        .update({ itinerary_data: itinerary_data })
+        .eq('id', id);
 
-      if (error) {
-        console.error('Public trip fetch error:', error);
-        return res.status(404).json({ success: false, error: '일정을 찾을 수 없습니다.' });
-      }
+      updatedCount++;
+      results.push({ id, destination, status: "updated", image: newImage });
 
-      if (!data) {
-        return res.status(404).json({ success: false, error: '일정을 찾을 수 없습니다.' });
-      }
-
-      res.status(200).json({ success: true, data });
-    } catch (error) {
-      console.error('Public trip error:', error);
-      res.status(500).json({ success: false, error: '서버 오류가 발생했습니다.' });
-    }
-  });
-
-  // --- [API 7] 내 여행 목록 조회 ---
-  app.get('/api/my-trips', async (req, res) => {
-    const { user_id } = req.query;
-    if (!user_id) return res.status(400).json({ error: "User ID Required" });
-
-    try {
-      const { data, error } = await supabase
-        .from('trip_plans')
-        .select('*')
-        .eq('user_id', user_id)
-        .order('created_at', { ascending: false });
-
-      if (error) throw error;
-      res.status(200).json({ success: true, data });
-    } catch (error) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  // --- [API 8] 여행 일정 삭제 ---
-  app.delete('/api/trip/:id', async (req, res) => {
-    const { id } = req.params;
-    const { user_id } = req.body;
-
-    if (!user_id) return res.status(400).json({ error: "User ID Required" });
-
-    try {
-      const { error } = await supabase
-        .from('trip_plans')
-        .delete()
-        .eq('id', id)
-        .eq('user_id', user_id);
-
-      if (error) throw error;
-      res.status(200).json({ success: true });
-    } catch (error) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  // --- [API 9] 커뮤니티 게시판 ---
-  app.get('/api/community', async (req, res) => {
-    try {
-      const { data, error } = await supabase
-        .from('community')
-        .select('*')
-        .order('created_at', { ascending: false });
-      if (error) throw error;
-      res.status(200).json({ success: true, data });
-    } catch (error) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  app.post('/api/community', async (req, res) => {
-    const { user_id, email, nickname, content, is_anonymous } = req.body;
-    if (!content) return res.status(400).json({ error: "내용이 필요합니다" });
-
-    try {
-      const { data, error } = await supabase.from('community').insert([{
-        user_id: user_id || null,
-        email: email || '익명',
-        nickname: nickname || '익명',
-        content,
-        is_anonymous: is_anonymous || false
-      }]).select();
-      if (error) throw error;
-      res.status(200).json({ success: true, data });
-    } catch (error) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  app.delete('/api/community/:id', async (req, res) => {
-    const { id } = req.params;
-    const { user_id, email } = req.body;
-
-    try {
-      const { data: post } = await supabase
-        .from('community')
-        .select('*')
-        .eq('id', id)
-        .single();
-
-      if (!post) return res.status(404).json({ error: "게시글을 찾을 수 없습니다" });
-
-      const isOwner = user_id && post.user_id === user_id;
-      const isAdmin = email === ADMIN_EMAIL;
-
-      if (!isOwner && !isAdmin) {
-        return res.status(403).json({ error: "삭제 권한이 없습니다" });
-      }
-
-      const { error } = await supabase.from('community').delete().eq('id', id);
-      if (error) throw error;
-      res.status(200).json({ success: true });
-    } catch (error) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  // --- [API 10] 관리자 페이지 ---
-  app.get('/api/admin/users', async (req, res) => {
-    try {
-      const { data, error } = await supabase
-        .from('user_limits')
-        .select('user_id, tier, usage_count')
-        .order('usage_count', { ascending: false });
-
-      if (error) throw error;
-      res.status(200).json({ success: true, data });
-    } catch (error) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  app.put('/api/admin/user/tier', async (req, res) => {
-    const { target_user_id, new_tier } = req.body;
-
-    if (!target_user_id || !new_tier) {
-      return res.status(400).json({ error: "필수 정보가 누락되었습니다" });
+      // 딜레이 (0.1초 - 텍스트 생성은 빠르므로 짧게)
+      await delay(100);
     }
 
-    try {
-      const { error } = await supabase
-        .from('user_limits')
-        .update({ tier: new_tier })
-        .eq('user_id', target_user_id);
+    console.log(`✅ Batch Update Completed. Updated: ${updatedCount}/${trips.length}`);
+    res.status(200).json({ success: true, updatedCount, total: trips.length, results });
 
-      if (error) throw error;
-      res.status(200).json({ success: true, message: "등급이 변경되었습니다" });
-    } catch (error) {
-      res.status(500).json({ error: error.message });
+  } catch (error) {
+    console.error("Batch Update Error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- [API 11] 건의사항 삭제 ---
+app.delete('/api/board/:id', async (req, res) => {
+  const { id } = req.params;
+  const { user_id, email } = req.body;
+
+  try {
+    const { data: suggestion } = await supabase
+      .from('suggestions')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (!suggestion) return res.status(404).json({ error: "건의사항을 찾을 수 없습니다" });
+
+    const isOwner = user_id && suggestion.user_id === user_id;
+    const isAdmin = email === ADMIN_EMAIL;
+
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({ error: "삭제 권한이 없습니다" });
     }
-  });
 
-  // --- [API 10.5] 표지 사진 일괄 업데이트 (Admin) ---
-  app.post('/api/admin/update-covers', async (req, res) => {
-    const { secret_key } = req.body;
-    // 간단한 보안 키 확인 (실제 운영 시에는 더 강력한 보안 필요)
-    if (secret_key !== process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY && secret_key !== "admin_secret") {
-      return res.status(403).json({ error: "Unauthorized" });
-    }
+    const { error } = await supabase.from('suggestions').delete().eq('id', id);
+    if (error) throw error;
+    res.status(200).json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
-    try {
-      console.log("🔄 Starting Batch Cover Image Update...");
-
-      // 1. 모든 여행 일정 가져오기
-      const { data: trips, error } = await supabase
-        .from('trip_plans')
-        .select('id, destination, itinerary_data')
-        .order('created_at', { ascending: false });
-
-      if (error) throw error;
-
-      let updatedCount = 0;
-      const results = [];
-
-      // 2. 순차적으로 업데이트 (Rate Limit 방지)
-      for (const trip of trips) {
-        const { id, destination, itinerary_data } = trip;
-
-        // 이미 좋은 이미지가 있는지 확인 (선택 사항: 강제 업데이트 플래그 추가 가능)
-        // 여기서는 무조건 업데이트하거나, 특정 조건(예: unsplash)일 때만 업데이트하도록 설정 가능
-        // 현재는 "기존 이미지 갱신" 요청이므로 모든 항목에 대해 시도합니다.
-
-        // Text-Based Cover Image Update -> SWITCHED TO "Null" for Dynamic Fetch
-        // Old: const koreanRegion = await getKoreanRegionName(destination);
-        // Old: const newImage = `${SERVER_BASE_URL}/api/text-cover?text=${encodeURIComponent(koreanRegion)}`;
-
-        const newImage = null; // Let frontend fetch dynamically via getTripCoverImage
-        console.log(`🖼️ Updating Trip ${id} (${destination}) -> NULL (Dynamic Fetch Enabled)`);
-
-        // JSON 데이터 업데이트
-        itinerary_data.cover_image = newImage;
-
-        // DB 저장
-        await supabase
-          .from('trip_plans')
-          .update({ itinerary_data: itinerary_data })
-          .eq('id', id);
-
-        updatedCount++;
-        results.push({ id, destination, status: "updated", image: newImage });
-
-        // 딜레이 (0.1초 - 텍스트 생성은 빠르므로 짧게)
-        await delay(100);
-      }
-
-      console.log(`✅ Batch Update Completed. Updated: ${updatedCount}/${trips.length}`);
-      res.status(200).json({ success: true, updatedCount, total: trips.length, results });
-
-    } catch (error) {
-      console.error("Batch Update Error:", error);
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  // --- [API 11] 건의사항 삭제 ---
-  app.delete('/api/board/:id', async (req, res) => {
-    const { id } = req.params;
-    const { user_id, email } = req.body;
-
-    try {
-      const { data: suggestion } = await supabase
-        .from('suggestions')
-        .select('*')
-        .eq('id', id)
-        .single();
-
-      if (!suggestion) return res.status(404).json({ error: "건의사항을 찾을 수 없습니다" });
-
-      const isOwner = user_id && suggestion.user_id === user_id;
-      const isAdmin = email === ADMIN_EMAIL;
-
-      if (!isOwner && !isAdmin) {
-        return res.status(403).json({ error: "삭제 권한이 없습니다" });
-      }
-
-      const { error } = await supabase.from('suggestions').delete().eq('id', id);
-      if (error) throw error;
-      res.status(200).json({ success: true });
-    } catch (error) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  // Helper: Extract Korean Region Name using Gemini (Cheap & Accurate)
-  async function getKoreanRegionName(destination) {
-    try {
-      const prompt = `
+// Helper: Extract Korean Region Name using Gemini (Cheap & Accurate)
+async function getKoreanRegionName(destination) {
+  try {
+    const prompt = `
       Extract only the core city/region name in Korean from: "${destination}".
       - Remove country name (e.g., "South Korea", "Japan", "USA", "United States", "대한민국", "미국").
       - If English, translate to Korean (e.g., "Tokyo" -> "도쿄", "New York" -> "뉴욕").
@@ -1156,36 +1149,36 @@ app.get(/\/api\/proxy\/google-photo\/(.*)/, async (req, res) => {
         - "시", "군", "구", "주" (State) suffix removal if it makes sense.
       - Output ONLY the clean name (no extra text).
     `;
-      const result = await model.generateContent({
-        contents: [{ role: "user", parts: [{ text: prompt }] }]
-      });
-      const text = result.response.text().trim();
-      // Remove any accidental quotes or markdown
-      return text.replace(/["'`*]/g, "").trim();
-    } catch (e) {
-      console.error("Translation Error:", e);
-      // Fallback: simple string cleaning
-      return destination.split(',')[0].trim().replace(/[시군구도주]$/, '');
-    }
+    const result = await model.generateContent({
+      contents: [{ role: "user", parts: [{ text: prompt }] }]
+    });
+    const text = result.response.text().trim();
+    // Remove any accidental quotes or markdown
+    return text.replace(/["'`*]/g, "").trim();
+  } catch (e) {
+    console.error("Translation Error:", e);
+    // Fallback: simple string cleaning
+    return destination.split(',')[0].trim().replace(/[시군구도주]$/, '');
+  }
+}
+
+// --- [API 13] Text Cover Image Generator (SVG) ---
+app.get('/api/text-cover', (req, res) => {
+  const { text } = req.query;
+  const displayText = text || "TripGen";
+
+  // Deterministic Color Generation based on text
+  let hash = 0;
+  for (let i = 0; i < displayText.length; i++) {
+    hash = displayText.charCodeAt(i) + ((hash << 5) - hash);
   }
 
-  // --- [API 13] Text Cover Image Generator (SVG) ---
-  app.get('/api/text-cover', (req, res) => {
-    const { text } = req.query;
-    const displayText = text || "TripGen";
+  const c1 = (hash & 0x00FFFFFF).toString(16).toUpperCase();
+  const c2 = ((hash * 123) & 0x00FFFFFF).toString(16).toUpperCase();
+  const color1 = "#" + "00000".substring(0, 6 - c1.length) + c1;
+  const color2 = "#" + "00000".substring(0, 6 - c2.length) + c2;
 
-    // Deterministic Color Generation based on text
-    let hash = 0;
-    for (let i = 0; i < displayText.length; i++) {
-      hash = displayText.charCodeAt(i) + ((hash << 5) - hash);
-    }
-
-    const c1 = (hash & 0x00FFFFFF).toString(16).toUpperCase();
-    const c2 = ((hash * 123) & 0x00FFFFFF).toString(16).toUpperCase();
-    const color1 = "#" + "00000".substring(0, 6 - c1.length) + c1;
-    const color2 = "#" + "00000".substring(0, 6 - c2.length) + c2;
-
-    const svg = `
+  const svg = `
     <svg width="800" height="600" xmlns="http://www.w3.org/2000/svg">
       <defs>
         <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
@@ -1200,8 +1193,10 @@ app.get(/\/api\/proxy\/google-photo\/(.*)/, async (req, res) => {
     </svg>
   `;
 
-    res.setHeader('Content-Type', 'image/svg+xml');
-    res.send(svg);
-  });
+  res.setHeader('Content-Type', 'image/svg+xml');
+  res.send(svg);
+});
 
+app.listen(PORT, () => {
+  console.log(`🚀 TripGen Server running on port ${PORT}`);
 });
