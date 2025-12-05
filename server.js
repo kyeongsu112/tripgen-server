@@ -810,13 +810,12 @@ app.get('/api/places/autocomplete', async (req, res) => {
     // [Fix] Prioritize Korean results if query contains Korean
     const isKoreanQuery = /[가-힣]/.test(query);
     if (isKoreanQuery) {
-      predictions.sort((a, b) => {
-        const aIsKorea = a.description.includes("대한민국") || a.description.includes("South Korea");
-        const bIsKorea = b.description.includes("대한민국") || b.description.includes("South Korea");
-        if (aIsKorea && !bIsKorea) return -1;
-        if (!aIsKorea && bIsKorea) return 1;
-        return 0;
-      });
+      // 한국어로 검색 시 한국 지역만 필터링 (베트남, 인도 등 제외)
+      predictions = predictions.filter(p =>
+        p.description.includes("대한민국") ||
+        p.description.includes("South Korea") ||
+        p.description.includes("Korea")
+      );
     }
 
     res.status(200).json({ predictions: predictions });
