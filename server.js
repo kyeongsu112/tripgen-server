@@ -223,7 +223,20 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
           });
       }
     }
-    return cachedPlace;
+
+    // 🔧 [Fix] DB 필드명(snake_case)을 프론트엔드 필드명(camelCase)으로 변환
+    return {
+      place_id: cachedPlace.place_id,
+      place_name: cachedPlace.place_name,
+      rating: cachedPlace.rating,
+      ratingCount: cachedPlace.rating_count,
+      googleMapsUri: cachedPlace.google_maps_uri,
+      websiteUri: cachedPlace.website_uri,
+      photoUrl: cachedPlace.photo_url,  // ✅ photo_url → photoUrl
+      photoReference: cachedPlace.photo_reference,
+      location: cachedPlace.location,
+      types: cachedPlace.types
+    };
   }
 
   // [3] Google Places API Call (텍스트 정보만! 사진 X)
