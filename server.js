@@ -524,11 +524,35 @@ async function fetchWeatherApiFallback(destination, startDate, endDate) {
   }
 
   try {
+    // 🔧 한글 도시명 영어 변환 매핑
+    const cityNameMap = {
+      '서울': 'Seoul', '부산': 'Busan', '제주': 'Jeju', '인천': 'Incheon',
+      '대구': 'Daegu', '광주': 'Gwangju', '대전': 'Daejeon', '울산': 'Ulsan',
+      '도쿄': 'Tokyo', '오사카': 'Osaka', '교토': 'Kyoto', '후쿠오카': 'Fukuoka',
+      '삿포로': 'Sapporo', '나고야': 'Nagoya', '오키나와': 'Okinawa',
+      '뉴욕': 'New York', '로스앤젤레스': 'Los Angeles', '샌프란시스코': 'San Francisco',
+      '파리': 'Paris', '런던': 'London', '로마': 'Rome', '바르셀로나': 'Barcelona',
+      '방콕': 'Bangkok', '싱가포르': 'Singapore', '홍콩': 'Hong Kong',
+      '다낭': 'Da Nang', '호이안': 'Hoi An', '타이베이': 'Taipei'
+    };
+
     // 도시 이름 정제
     let cityName = destination.split(',')[0].trim();
-    const englishMatch = cityName.match(/[A-Za-z\s]+/);
-    if (englishMatch && englishMatch[0].trim().length > 2) {
-      cityName = englishMatch[0].trim();
+
+    // 한글 도시명에서 영어로 변환
+    for (const [korean, english] of Object.entries(cityNameMap)) {
+      if (cityName.includes(korean)) {
+        cityName = english;
+        break;
+      }
+    }
+
+    // 영어 이름 추출 (fallback)
+    if (!/^[A-Za-z\s]+$/.test(cityName)) {
+      const englishMatch = destination.match(/[A-Za-z\s]+/);
+      if (englishMatch && englishMatch[0].trim().length > 2) {
+        cityName = englishMatch[0].trim();
+      }
     }
 
     console.log(`🌦️ WeatherAPI.com Request: ${cityName}`);
