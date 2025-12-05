@@ -83,24 +83,45 @@ function cleanAndParseJSON(text) {
   }
 }
 
-// 네이버 이미지 검색 (Naver Search API)
-async function fetchNaverImage(query) {
+// 네이버 이미지 검색 (Naver Search API) - 개선된 버전
+async function fetchNaverImage(query, retryWithKeywords = true) {
   const clientId = process.env.NAVER_CLIENT_ID;
   const clientSecret = process.env.NAVER_CLIENT_SECRET;
 
   if (!clientId || !clientSecret) return null;
 
-  try {
-    const response = await axios.get('https://openapi.naver.com/v1/search/image', {
-      params: { query: query, display: 1, sort: 'sim', filter: 'medium' },
-      headers: { 'X-Naver-Client-Id': clientId, 'X-Naver-Client-Secret': clientSecret }
-    });
-    if (response.data.items && response.data.items.length > 0) {
-      return response.data.items[0].link;
+  const trySearch = async (searchQuery) => {
+    try {
+      const response = await axios.get('https://openapi.naver.com/v1/search/image', {
+        params: { query: searchQuery, display: 3, sort: 'sim', filter: 'medium' },
+        headers: { 'X-Naver-Client-Id': clientId, 'X-Naver-Client-Secret': clientSecret }
+      });
+      if (response.data.items && response.data.items.length > 0) {
+        // 첫 번째 결과 반환 (필터링 가능)
+        return response.data.items[0].link;
+      }
+    } catch (error) {
+      console.error(`Naver Image Search Error for ${searchQuery}:`, error.message);
     }
-  } catch (error) {
-    console.error(`Naver Image Search Error for ${query}:`, error.message);
+    return null;
+  };
+
+  // 1차 시도: 원본 쿼리
+  let result = await trySearch(query);
+  if (result) return result;
+
+  // 2차 시도: 여행/관광 키워드 추가
+  if (retryWithKeywords) {
+    const travelKeywords = ['여행', '관광', '풍경'];
+    for (const keyword of travelKeywords) {
+      result = await trySearch(`${query} ${keyword}`);
+      if (result) {
+        console.log(`📸 Found image with keyword: ${query} ${keyword}`);
+        return result;
+      }
+    }
   }
+
   return null;
 }
 
@@ -214,17 +235,30 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
 
     // [4] Naver Image Search (Primary)
     const searchName = place.displayName?.text || placeName;
+    const isEnglishName = /^[A-Za-z\s\-']+$/.test(searchName);
+
     const getSearchSuffix = (types = []) => {
-      if (types.some(t => ['restaurant', 'food', 'cafe', 'bar', 'bakery', 'meal_takeaway'].includes(t))) return " 음식";
-      if (types.some(t => ['tourist_attraction', 'point_of_interest', 'park', 'landmark'].includes(t))) return " 전경";
-      if (types.some(t => ['lodging', 'hotel', 'guest_house'].includes(t))) return " 객실";
-      if (types.some(t => ['shopping_mall', 'store'].includes(t))) return " 매장";
-      return " 사진";
+      if (types.some(t => ['restaurant', 'food', 'cafe', 'bar', 'bakery', 'meal_takeaway'].includes(t))) return " 음식 맛집";
+      if (types.some(t => ['tourist_attraction', 'point_of_interest', 'park', 'landmark'].includes(t))) return " 관광지 풍경";
+      if (types.some(t => ['lodging', 'hotel', 'guest_house'].includes(t))) return " 호텔 객실";
+      if (types.some(t => ['shopping_mall', 'store'].includes(t))) return " 매장 쇼핑";
+      return " 여행";
     };
 
     const suffix = getSearchSuffix(place.types);
-    const searchQuery = cityContext ? `${cityContext} ${searchName}${suffix}` : `${searchName}${suffix}`;
 
+    // 영어 이름일 경우 도시 컨텍스트 필수 + 한글 키워드 강화
+    let searchQuery;
+    if (isEnglishName && cityContext) {
+      searchQuery = `${cityContext} ${searchName}${suffix}`;
+    } else if (isEnglishName) {
+      // 도시 컨텍스트 없으면 "여행"으로 검색
+      searchQuery = `${searchName}${suffix}`;
+    } else {
+      searchQuery = cityContext ? `${cityContext} ${searchName}${suffix}` : `${searchName}${suffix}`;
+    }
+
+    console.log(`🔍 Naver Search Query: ${searchQuery}`);
     let photoUrl = await fetchNaverImage(searchQuery);
 
     // [5] Fallback: Generic Image (Google Photos Removed for Cost)
@@ -301,9 +335,21 @@ async function calculateRoute(originId, destId) {
 async function fetchDailyWeather(destination, startDate, endDate) {
   // 도시 이름 정제 함수
   const cleanCityName = (rawName) => {
+    // 1. 국가명 제거
     let name = rawName.replace(/일본|대한민국|한국|중국|미국|프랑스|이탈리아|스페인|영국|독일/g, '').trim();
-    // [Fix] 공백 분리 로직 제거 (뉴욕 주 -> 주 되는 문제 해결)
-    // 필요한 경우에만 정제하도록 변경
+
+    // 2. 콤마가 있으면 첫 번째 부분만 사용 (예: "New York, 뉴욕" -> "New York")
+    if (name.includes(',')) {
+      name = name.split(',')[0].trim();
+    }
+
+    // 3. 한글/영어 혼합 시 영어 이름 우선 추출 (예: "뉴욕 New York" -> "New York")
+    const englishMatch = name.match(/[A-Za-z\s]+/);
+    if (englishMatch && englishMatch[0].trim().length > 2) {
+      name = englishMatch[0].trim();
+    }
+
+    // 4. 한국 행정구역 접미사 제거
     return name.replace(/[시군구도부현]$/, '');
   };
 
@@ -489,8 +535,7 @@ app.post('/api/generate-trip', async (req, res) => {
     // 병렬 처리 & 데이터 보정
     const seenPlaces = new Set(); // ✨ [Fix] Move seenPlaces OUT of the loop to track duplicates across ALL days
 
-    // 2. 병렬 처리 대신 "순차 처리(Sequential)"로 변경하여 API 부하 분산
-    // Promise.all 대신 for...of 루프 사용
+    // ⚡ [Optimization] 병렬 처리로 전환 - 속도 대폭 개선
     for (const dayPlan of itineraryJson.itinerary) {
       const uniqueActivities = [];
 
@@ -507,15 +552,12 @@ app.post('/api/generate-trip', async (req, res) => {
       });
       dayPlan.activities = uniqueActivities;
 
-      // 액티비티 상세 정보 조회 (순차 처리 + 딜레이)
-      for (let i = 0; i < dayPlan.activities.length; i++) {
-        const activity = dayPlan.activities[i];
-
-        // 이동/숙소는 패스하지만, 정보가 필요하면 로직 유지
-        if (activity.place_name.includes("이동") && !activity.place_name.includes("숙소")) continue;
-
-        // 💡 [Rate Limit 방지] 요청 사이에 0.2초 딜레이
-        await delay(200);
+      // ⚡ 병렬 처리로 장소 상세 정보 조회
+      const detailsPromises = dayPlan.activities.map(async (activity, i) => {
+        // 이동은 패스
+        if (activity.place_name.includes("이동") && !activity.place_name.includes("숙소")) {
+          return { index: i, data: activity };
+        }
 
         // [Cache Check]
         let details;
@@ -523,11 +565,11 @@ app.post('/api/generate-trip', async (req, res) => {
           details = await placeDetailsCache.get(activity.place_name);
         } else {
           const detailsPromise = fetchPlaceDetails(activity.place_name, destination);
-          addToCache(activity.place_name, detailsPromise); // Use global cache helper
+          addToCache(activity.place_name, detailsPromise);
           details = await detailsPromise;
         }
 
-        if (!details) details = { place_name: activity.place_name }; // ✨ 안전장치 추가
+        if (!details) details = { place_name: activity.place_name };
 
         let finalBookingUrl = null;
         const isPark = details.types && (details.types.includes('park') || details.types.includes('natural_feature'));
@@ -538,24 +580,37 @@ app.post('/api/generate-trip', async (req, res) => {
           else finalBookingUrl = `https://www.google.com/search?q=${destination}+${activity.place_name}+예약`;
         }
 
-        // 객체 업데이트
-        dayPlan.activities[i] = {
-          ...activity,
-          ...details,
-          booking_url: finalBookingUrl,
-          place_name: details.place_name || activity.place_name
+        return {
+          index: i,
+          data: {
+            ...activity,
+            ...details,
+            booking_url: finalBookingUrl,
+            place_name: details.place_name || activity.place_name
+          }
         };
-      }
+      });
 
-      // 경로 계산 (순차 처리)
+      // 모든 장소 정보 병렬 조회 완료 대기
+      const results = await Promise.all(detailsPromises);
+      results.forEach(({ index, data }) => {
+        dayPlan.activities[index] = data;
+      });
+
+      // ⚡ 경로 계산도 병렬 처리
+      const routePromises = [];
       for (let i = 1; i < dayPlan.activities.length; i++) {
         const prev = dayPlan.activities[i - 1];
         const curr = dayPlan.activities[i];
         if (prev.place_id && curr.place_id) {
-          const routeInfo = await calculateRoute(prev.place_id, curr.place_id);
-          if (routeInfo) curr.travel_info = routeInfo;
+          routePromises.push(
+            calculateRoute(prev.place_id, curr.place_id).then(routeInfo => {
+              if (routeInfo) curr.travel_info = routeInfo;
+            })
+          );
         }
       }
+      await Promise.all(routePromises);
     }
 
     // ✨ [Optimization] Cover Photo Logic
@@ -760,12 +815,7 @@ app.get('/api/place-image', async (req, res) => {
   }
 });
 
-// --- [API 3.6] Google Photo Proxy REMOVED (Cost Saving) ---
-// Proxies the image data from Google Places Media API
-app.get(/\/api\/proxy\/google-photo\/(.*)/, async (req, res) => {
-  // Logic removed to save costs
-  return res.redirect(FALLBACK_IMAGE_URL);
-});
+
 
 // --- [API 3] 자동완성 (New API + 도시 필터링) ---
 app.get('/api/places/autocomplete', async (req, res) => {
@@ -1132,69 +1182,7 @@ app.delete('/api/board/:id', async (req, res) => {
   }
 });
 
-// Helper: Extract Korean Region Name using Gemini (Cheap & Accurate)
-async function getKoreanRegionName(destination) {
-  try {
-    const prompt = `
-      Extract only the core city/region name in Korean from: "${destination}".
-      - Remove country name (e.g., "South Korea", "Japan", "USA", "United States", "대한민국", "미국").
-      - If English, translate to Korean (e.g., "Tokyo" -> "도쿄", "New York" -> "뉴욕").
-      - **[IMPORTANT] Remove administrative suffixes & State names:**
-        - "서울특별시" -> "서울", "부산광역시" -> "부산", "제주특별자치도" -> "제주"
-        - "도쿄도" -> "도쿄", "오사카부" -> "오사카"
-        - "New York, NY" -> "뉴욕" (Remove state abbreviation)
-        - "Los Angeles, California" -> "로스앤젤레스" (Remove state name)
-        - "Las Vegas, NV" -> "라스베이거스"
-        - "시", "군", "구", "주" (State) suffix removal if it makes sense.
-      - Output ONLY the clean name (no extra text).
-    `;
-    const result = await model.generateContent({
-      contents: [{ role: "user", parts: [{ text: prompt }] }]
-    });
-    const text = result.response.text().trim();
-    // Remove any accidental quotes or markdown
-    return text.replace(/["'`*]/g, "").trim();
-  } catch (e) {
-    console.error("Translation Error:", e);
-    // Fallback: simple string cleaning
-    return destination.split(',')[0].trim().replace(/[시군구도주]$/, '');
-  }
-}
 
-// --- [API 13] Text Cover Image Generator (SVG) ---
-app.get('/api/text-cover', (req, res) => {
-  const { text } = req.query;
-  const displayText = text || "TripGen";
-
-  // Deterministic Color Generation based on text
-  let hash = 0;
-  for (let i = 0; i < displayText.length; i++) {
-    hash = displayText.charCodeAt(i) + ((hash << 5) - hash);
-  }
-
-  const c1 = (hash & 0x00FFFFFF).toString(16).toUpperCase();
-  const c2 = ((hash * 123) & 0x00FFFFFF).toString(16).toUpperCase();
-  const color1 = "#" + "00000".substring(0, 6 - c1.length) + c1;
-  const color2 = "#" + "00000".substring(0, 6 - c2.length) + c2;
-
-  const svg = `
-    <svg width="800" height="600" xmlns="http://www.w3.org/2000/svg">
-      <defs>
-        <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
-          <stop offset="0%" style="stop-color:${color1};stop-opacity:1" />
-          <stop offset="100%" style="stop-color:${color2};stop-opacity:1" />
-        </linearGradient>
-      </defs>
-      <rect width="100%" height="100%" fill="url(#grad)" />
-      <text x="50%" y="50%" font-family="Arial, sans-serif" font-size="60" font-weight="bold" fill="white" text-anchor="middle" dominant-baseline="middle" style="text-shadow: 2px 2px 4px rgba(0,0,0,0.5);">
-        ${displayText}
-      </text>
-    </svg>
-  `;
-
-  res.setHeader('Content-Type', 'image/svg+xml');
-  res.send(svg);
-});
 
 app.listen(PORT, () => {
   console.log(`🚀 TripGen Server running on port ${PORT}`);
