@@ -90,14 +90,32 @@ async function fetchNaverImage(query, retryWithKeywords = true) {
 
   if (!clientId || !clientSecret) return null;
 
+  // 🔧 부적절한 이미지 URL 필터
+  const isValidImageUrl = (url) => {
+    if (!url) return false;
+    const badPatterns = [
+      'profile', 'avatar', 'user', 'thumbnail', 'icon',
+      'logo', 'banner', 'advertisement', 'ad_', 'spotify',
+      'album', 'cover', 'music', 'person', 'people'
+    ];
+    const lowerUrl = url.toLowerCase();
+    return !badPatterns.some(pattern => lowerUrl.includes(pattern));
+  };
+
   const trySearch = async (searchQuery) => {
     try {
       const response = await axios.get('https://openapi.naver.com/v1/search/image', {
-        params: { query: searchQuery, display: 3, sort: 'sim', filter: 'medium' },
+        params: { query: searchQuery, display: 10, sort: 'sim', filter: 'large' },
         headers: { 'X-Naver-Client-Id': clientId, 'X-Naver-Client-Secret': clientSecret }
       });
       if (response.data.items && response.data.items.length > 0) {
-        // 첫 번째 결과 반환 (필터링 가능)
+        // 🔧 유효한 이미지만 필터링
+        for (const item of response.data.items) {
+          if (isValidImageUrl(item.link)) {
+            return item.link;
+          }
+        }
+        // 필터 통과 못하면 첫 번째 결과 반환
         return response.data.items[0].link;
       }
     } catch (error) {
@@ -112,7 +130,7 @@ async function fetchNaverImage(query, retryWithKeywords = true) {
 
   // 2차 시도: 여행/관광 키워드 추가
   if (retryWithKeywords) {
-    const travelKeywords = ['여행', '관광', '풍경'];
+    const travelKeywords = ['여행 사진', '관광 명소', '풍경 사진'];
     for (const keyword of travelKeywords) {
       result = await trySearch(`${query} ${keyword}`);
       if (result) {
@@ -246,11 +264,12 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
     const isEnglishName = /^[A-Za-z\s\-']+$/.test(searchName);
 
     const getSearchSuffix = (types = []) => {
-      if (types.some(t => ['restaurant', 'food', 'cafe', 'bar', 'bakery', 'meal_takeaway'].includes(t))) return " 음식 맛집";
-      if (types.some(t => ['tourist_attraction', 'point_of_interest', 'park', 'landmark'].includes(t))) return " 관광지 풍경";
-      if (types.some(t => ['lodging', 'hotel', 'guest_house'].includes(t))) return " 호텔 객실";
-      if (types.some(t => ['shopping_mall', 'store'].includes(t))) return " 매장 쇼핑";
-      return " 여행";
+      if (types.some(t => ['restaurant', 'food', 'cafe', 'bar', 'bakery', 'meal_takeaway'].includes(t))) return " 맛집 음식 사진";
+      if (types.some(t => ['tourist_attraction', 'point_of_interest', 'landmark', 'museum'].includes(t))) return " 관광명소 사진";
+      if (types.some(t => ['park', 'natural_feature'].includes(t))) return " 공원 풍경 사진";
+      if (types.some(t => ['lodging', 'hotel', 'guest_house'].includes(t))) return " 호텔 외관 사진";
+      if (types.some(t => ['shopping_mall', 'store'].includes(t))) return " 쇼핑몰 내부 사진";
+      return " 관광 사진";
     };
 
     const suffix = getSearchSuffix(place.types);
@@ -339,8 +358,21 @@ async function calculateRoute(originId, destId) {
   return null;
 }
 
-// 날씨 정보 조회 (Open-Meteo) - 개선된 버전 (Network Fix + Name Cleaning)
+// 🔧 날씨 API 인메모리 캐시 (429 에러 방지)
+const weatherCache = new Map();
+const WEATHER_CACHE_TTL = 60 * 60 * 1000; // 1시간
+
+// 날씨 정보 조회 (Open-Meteo) - 개선된 버전 (Network Fix + Name Cleaning + Cache)
 async function fetchDailyWeather(destination, startDate, endDate) {
+  // 🔧 캐시 확인
+  const cacheKey = `${destination}_${startDate}_${endDate}`;
+  if (weatherCache.has(cacheKey)) {
+    const cached = weatherCache.get(cacheKey);
+    if (Date.now() - cached.timestamp < WEATHER_CACHE_TTL) {
+      console.log(`☁️ Weather Cache Hit: ${destination}`);
+      return cached.data;
+    }
+  }
   // 도시 이름 정제 함수
   const cleanCityName = (rawName) => {
     // 1. 국가명 제거
@@ -457,19 +489,96 @@ async function fetchDailyWeather(destination, startDate, endDate) {
     });
 
     console.log(`✅ Weather data fetched successfully for ${geoName}:`, Object.keys(weatherMap).length, 'days');
+
+    // 🔧 캐시에 저장
+    weatherCache.set(cacheKey, { data: weatherMap, timestamp: Date.now() });
+
     return weatherMap;
   } catch (error) {
     console.error("❌ Weather Fetch Error:", error.message);
-    if (error.code === 'ECONNABORTED') {
-      console.error("⏰ Request timed out");
+
+    // 🔧 429 에러 시 WeatherAPI.com으로 fallback
+    if (error.response?.status === 429) {
+      console.log("🔄 Trying WeatherAPI.com fallback...");
+      const fallbackResult = await fetchWeatherApiFallback(destination, startDate, endDate);
+      if (fallbackResult) {
+        weatherCache.set(cacheKey, { data: fallbackResult, timestamp: Date.now() });
+        return fallbackResult;
+      }
     }
+
     console.error("📍 Destination:", destination);
     if (error.response) {
       console.error("🔴 API Response Error:", error.response.status, error.response.data);
-    } else {
-      console.error("🔴 Error Stack:", error.stack);
+    }
+    return null;
+  }
+}
+
+// 🔧 WeatherAPI.com Fallback 함수
+async function fetchWeatherApiFallback(destination, startDate, endDate) {
+  const apiKey = process.env.WEATHER_API_KEY;
+  if (!apiKey) {
+    console.log("⚠️ WEATHER_API_KEY not configured, skipping fallback");
+    return null;
+  }
+
+  try {
+    // 도시 이름 정제
+    let cityName = destination.split(',')[0].trim();
+    const englishMatch = cityName.match(/[A-Za-z\s]+/);
+    if (englishMatch && englishMatch[0].trim().length > 2) {
+      cityName = englishMatch[0].trim();
+    }
+
+    console.log(`🌦️ WeatherAPI.com Request: ${cityName}`);
+
+    // WeatherAPI.com은 예보 일수 기반 (최대 14일)
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    const days = Math.min(14, Math.ceil((end - start) / (1000 * 60 * 60 * 24)) + 1);
+
+    const response = await axios.get('https://api.weatherapi.com/v1/forecast.json', {
+      params: {
+        key: apiKey,
+        q: cityName,
+        days: days,
+        lang: 'ko'
+      },
+      timeout: 5000
+    });
+
+    if (!response.data.forecast?.forecastday) {
+      console.error("❌ WeatherAPI.com: No forecast data");
       return null;
     }
+
+    const weatherMap = {};
+    response.data.forecast.forecastday.forEach(day => {
+      // WeatherAPI.com 코드를 Open-Meteo 코드로 변환 (간단 매핑)
+      const conditionCode = day.day.condition.code;
+      let weatherCode = 0; // 기본: 맑음
+
+      if (conditionCode === 1000) weatherCode = 0; // Sunny/Clear
+      else if ([1003, 1006, 1009].includes(conditionCode)) weatherCode = 2; // Cloudy
+      else if ([1030, 1135, 1147].includes(conditionCode)) weatherCode = 45; // Fog
+      else if ([1063, 1150, 1153, 1180, 1183, 1186, 1189, 1192, 1195, 1240, 1243, 1246].includes(conditionCode)) weatherCode = 61; // Rain
+      else if ([1066, 1114, 1117, 1210, 1213, 1216, 1219, 1222, 1225, 1255, 1258].includes(conditionCode)) weatherCode = 71; // Snow
+      else if ([1087, 1273, 1276, 1279, 1282].includes(conditionCode)) weatherCode = 95; // Thunderstorm
+
+      weatherMap[day.date] = {
+        code: weatherCode,
+        max: Math.round(day.day.maxtemp_c),
+        min: Math.round(day.day.mintemp_c)
+      };
+    });
+
+    console.log(`✅ WeatherAPI.com: Got ${Object.keys(weatherMap).length} days of forecast`);
+    return weatherMap;
+
+  } catch (err) {
+    console.error("❌ WeatherAPI.com Error:", err.message);
+    return null;
   }
 }
 
