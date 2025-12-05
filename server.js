@@ -776,20 +776,21 @@ app.post('/api/generate-trip', async (req, res) => {
         dayPlan.activities[index] = data;
       });
 
-      // ⚡ 경로 계산도 병렬 처리
-      const routePromises = [];
-      for (let i = 1; i < dayPlan.activities.length; i++) {
-        const prev = dayPlan.activities[i - 1];
-        const curr = dayPlan.activities[i];
-        if (prev.place_id && curr.place_id) {
-          routePromises.push(
-            calculateRoute(prev.place_id, curr.place_id).then(routeInfo => {
-              if (routeInfo) curr.travel_info = routeInfo;
-            })
-          );
-        }
-      }
-      await Promise.all(routePromises);
+      // ⚡ [Optimization] 경로 계산은 On-Demand로 이동 (초기 로딩 3-5초 단축)
+      // 사용자가 이동수단 버튼 클릭 시 /api/calculate-route API 호출
+      // const routePromises = [];
+      // for (let i = 1; i < dayPlan.activities.length; i++) {
+      //   const prev = dayPlan.activities[i - 1];
+      //   const curr = dayPlan.activities[i];
+      //   if (prev.place_id && curr.place_id) {
+      //     routePromises.push(
+      //       calculateRoute(prev.place_id, curr.place_id).then(routeInfo => {
+      //         if (routeInfo) curr.travel_info = routeInfo;
+      //       })
+      //     );
+      //   }
+      // }
+      // await Promise.all(routePromises);
     }
 
     // ✨ [Optimization] Cover Photo Logic
@@ -1361,7 +1362,57 @@ app.delete('/api/board/:id', async (req, res) => {
   }
 });
 
+// --- [API] 경로 계산 On-Demand ---
+app.post('/api/calculate-route', async (req, res) => {
+  try {
+    const { origin_place_id, destination_place_id, mode } = req.body;
 
+    if (!origin_place_id || !destination_place_id) {
+      return res.status(400).json({ error: "출발지와 도착지 place_id가 필요합니다" });
+    }
+
+    // mode: walking, transit, driving (기본값: transit)
+    const travelMode = mode || 'transit';
+
+    const modeMap = {
+      'walking': 'walking',
+      'transit': 'transit',
+      'driving': 'driving'
+    };
+
+    const googleMode = modeMap[travelMode] || 'transit';
+
+    try {
+      const response = await axios.get('https://maps.googleapis.com/maps/api/directions/json', {
+        params: {
+          origin: `place_id:${origin_place_id}`,
+          destination: `place_id:${destination_place_id}`,
+          mode: googleMode,
+          language: 'ko',
+          key: GOOGLE_MAPS_API_KEY
+        }
+      });
+
+      if (response.data.routes && response.data.routes.length > 0) {
+        const leg = response.data.routes[0].legs[0];
+        return res.json({
+          success: true,
+          data: {
+            duration: leg.duration.text,
+            distance: leg.distance.text,
+            mode: travelMode === 'transit' ? '대중교통' : (travelMode === 'driving' ? '자동차' : '도보')
+          }
+        });
+      }
+    } catch (error) {
+      console.error(`Route calculation error:`, error.message);
+    }
+
+    res.json({ success: false, error: "경로를 찾을 수 없습니다" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 app.listen(PORT, () => {
   console.log(`🚀 TripGen Server running on port ${PORT}`);
