@@ -210,9 +210,17 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
 
   // [3] Google Places API Call (텍스트 정보만! 사진 X)
   try {
+    // 🔧 [Fix] 도시 컨텍스트를 검색어 앞에 배치하여 지역 바이어스 강화
+    // "타임스퀘어 뉴욕" 대신 "뉴욕 타임스퀘어"로 검색 = 더 정확한 결과
+    const placeSearchQuery = cityContext
+      ? `${cityContext} ${placeName}`
+      : placeName;
+
+    console.log(`🔍 Google Places Search: ${placeSearchQuery}`);
+
     const response = await axios.post(
       `https://places.googleapis.com/v1/places:searchText`,
-      { textQuery: `${placeName} ${cityContext}`, languageCode: "ko" },
+      { textQuery: placeSearchQuery, languageCode: "ko" },
       {
         headers: {
           "Content-Type": "application/json",
@@ -353,8 +361,37 @@ async function fetchDailyWeather(destination, startDate, endDate) {
     return name.replace(/[시군구도부현]$/, '');
   };
 
+  // 주요 도시 영문명 매핑 (Geocoding 정확도 향상)
+  const cityNameMap = {
+    // 일본
+    '교토': 'Kyoto', '오사카': 'Osaka', '도쿄': 'Tokyo', '후쿠오카': 'Fukuoka',
+    '삿포로': 'Sapporo', '나고야': 'Nagoya', '요코하마': 'Yokohama', '오키나와': 'Okinawa',
+    // 한국
+    '서울': 'Seoul', '부산': 'Busan', '제주': 'Jeju', '인천': 'Incheon', '대구': 'Daegu',
+    // 미국 (주요 도시 - City 붙여서 정확도 향상)
+    '뉴욕': 'New York City', 'New York': 'New York City',
+    '로스앤젤레스': 'Los Angeles', '라스베이거스': 'Las Vegas',
+    '샌프란시스코': 'San Francisco', '시카고': 'Chicago', '마이애미': 'Miami',
+    '보스턴': 'Boston', '시애틀': 'Seattle', '워싱턴': 'Washington DC',
+    // 유럽
+    '파리': 'Paris', '런던': 'London', '로마': 'Rome', '바르셀로나': 'Barcelona',
+    '암스테르담': 'Amsterdam', '프라하': 'Prague', '비엔나': 'Vienna',
+    // 아시아
+    '방콕': 'Bangkok', '홍콩': 'Hong Kong', '싱가포르': 'Singapore',
+    '다낭': 'Da Nang', '호이안': 'Hoi An', '나트랑': 'Nha Trang', '푸꾸옥': 'Phu Quoc',
+    '타이베이': 'Taipei', '가오슝': 'Kaohsiung',
+    // 중동/오세아니아
+    '두바이': 'Dubai', '시드니': 'Sydney', '멜버른': 'Melbourne'
+  };
+
   try {
-    const cleanedName = cleanCityName(destination);
+    let cleanedName = cleanCityName(destination);
+
+    // cityNameMap에서 매칭되면 변환
+    if (cityNameMap[cleanedName]) {
+      cleanedName = cityNameMap[cleanedName];
+    }
+
     console.log(`🌤️ Weather Fetch Started: ${destination} -> ${cleanedName} (${startDate} ~ ${endDate})`);
 
     const axiosConfig = {
@@ -362,35 +399,31 @@ async function fetchDailyWeather(destination, startDate, endDate) {
       family: 4      // IPv4 강제 (Node 17+ AggregateError 방지)
     };
 
-    // 1. Geocoding (한글 시도)
+    // 1. Geocoding (count=5로 늘려서 더 정확한 결과 선택)
     let geoRes = await axios.get(
-      `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(cleanedName)}&count=1&language=ko&format=json`,
+      `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(cleanedName)}&count=5&language=en&format=json`,
       axiosConfig
     );
 
-    // 한글로 검색 실패 시, 영어로 재시도
+    // 결과에서 인구가 가장 많은 도시 선택 (대도시 우선)
+    if (geoRes.data.results && geoRes.data.results.length > 0) {
+      const sortedResults = geoRes.data.results.sort((a, b) => (b.population || 0) - (a.population || 0));
+      geoRes.data.results = [sortedResults[0]];
+    }
+
+    // 검색 실패 시, 한글로 재시도
     if (!geoRes.data.results || geoRes.data.results.length === 0) {
-      console.log(`⚠️ Geocoding failed with Korean name (${cleanedName}), trying English...`);
-
-      // 간단한 한영 변환 시도 (주요 도시만)
-      const cityNameMap = {
-        '교토': 'Kyoto', '오사카': 'Osaka', '도쿄': 'Tokyo', '후쿠오카': 'Fukuoka',
-        '삿포로': 'Sapporo', '나고야': 'Nagoya', '요코하마': 'Yokohama', '오키나와': 'Okinawa',
-        '서울': 'Seoul', '부산': 'Busan', '제주': 'Jeju',
-        '파리': 'Paris', '런던': 'London', '뉴욕': 'New York', '로마': 'Rome',
-        '바르셀로나': 'Barcelona', '방콕': 'Bangkok', '홍콩': 'Hong Kong',
-        '싱가포르': 'Singapore', '두바이': 'Dubai', '시드니': 'Sydney',
-        '다낭': 'Da Nang', '호이안': 'Hoi An', '나트랑': 'Nha Trang', '푸꾸옥': 'Phu Quoc',
-        '타이베이': 'Taipei', '가오슝': 'Kaohsiung'
-      };
-
-      const englishName = cityNameMap[cleanedName] || cleanedName;
-      console.log(`🔄 Retrying with: ${englishName}`);
+      console.log(`⚠️ Geocoding failed with (${cleanedName}), trying Korean...`);
 
       geoRes = await axios.get(
-        `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(englishName)}&count=1&language=en&format=json`,
+        `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(destination)}&count=5&language=ko&format=json`,
         axiosConfig
       );
+
+      if (geoRes.data.results && geoRes.data.results.length > 0) {
+        const sortedResults = geoRes.data.results.sort((a, b) => (b.population || 0) - (a.population || 0));
+        geoRes.data.results = [sortedResults[0]];
+      }
     }
 
     if (!geoRes.data.results || geoRes.data.results.length === 0) {
