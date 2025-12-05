@@ -90,13 +90,17 @@ async function fetchNaverImage(query, retryWithKeywords = true) {
 
   if (!clientId || !clientSecret) return null;
 
-  // 🔧 부적절한 이미지 URL 필터
+  // 🔧 부적절한 이미지 URL 필터 + Hotlink Protection 도메인 차단
   const isValidImageUrl = (url) => {
     if (!url) return false;
     const badPatterns = [
       'profile', 'avatar', 'user', 'thumbnail', 'icon',
       'logo', 'banner', 'advertisement', 'ad_', 'spotify',
-      'album', 'cover', 'music', 'person', 'people'
+      'album', 'cover', 'music', 'person', 'people',
+      // Hotlink Protection 의심 도메인 (외부 로딩 차단)
+      'exp.cdn-hotels.com', 'tripadvisor', 'agoda', 'booking.com', 'hotels.com',
+      // 네이버 뉴스 이미지는 외부 로딩 차단될 수 있음
+      'imgnews.naver.net', 'news.naver.com'
     ];
     const lowerUrl = url.toLowerCase();
     return !badPatterns.some(pattern => lowerUrl.includes(pattern));
@@ -109,12 +113,25 @@ async function fetchNaverImage(query, retryWithKeywords = true) {
         headers: { 'X-Naver-Client-Id': clientId, 'X-Naver-Client-Secret': clientSecret }
       });
       if (response.data.items && response.data.items.length > 0) {
-        // 🔧 유효한 이미지만 필터링
+        // 1. 네이버 호스팅 이미지 우선 (pstatic.net, blog.naver 등) - 차단 안됨
+        for (const item of response.data.items) {
+          if (item.link.includes('pstatic.net') || item.link.includes('blog.naver.com') || item.link.includes('post.naver.com')) {
+            if (isValidImageUrl(item.link)) return item.link;
+          }
+        }
+
+        // 2. 그 외 유효한 이미지
         for (const item of response.data.items) {
           if (isValidImageUrl(item.link)) {
             return item.link;
           }
         }
+
+        // 3. 정 없으면 썸네일이라도 반환
+        if (response.data.items[0].thumbnail) {
+          return response.data.items[0].thumbnail;
+        }
+
         // 필터 통과 못하면 첫 번째 결과 반환
         return response.data.items[0].link;
       }
@@ -128,9 +145,25 @@ async function fetchNaverImage(query, retryWithKeywords = true) {
   let result = await trySearch(query);
   if (result) return result;
 
-  // 2차 시도: 여행/관광 키워드 추가
+  // 1차 시도: 원본 쿼리 (이미 위에서 선언됨)
+  // let result = await trySearch(query); // REMOVED
+  // if (result) return result; // REMOVED
+
+  // 2차 시도: "by ..." 패턴 제거 (예: "L7 MYEONGDONG by LOTTE" -> "L7 MYEONGDONG")
+  if (query.toLowerCase().includes(' by ')) {
+    const simplifiedQuery = query.replace(/\s+by\s+.*$/i, '');
+    console.log(`🔄 Retrying with simplified query: ${simplifiedQuery}`);
+    result = await trySearch(simplifiedQuery);
+    if (result) return result;
+
+    // 단순화된 쿼리에 "호텔" 등 키워드 추가 재시도
+    result = await trySearch(`${simplifiedQuery} hotel`);
+    if (result) return result;
+  }
+
+  // 3차 시도: 여행/관광 키워드 추가
   if (retryWithKeywords) {
-    const travelKeywords = ['여행 사진', '관광 명소', '풍경 사진'];
+    const travelKeywords = ['여행 사진', '관광 명소', '풍경 사진', '호텔'];
     for (const keyword of travelKeywords) {
       result = await trySearch(`${query} ${keyword}`);
       if (result) {
@@ -1413,6 +1446,10 @@ app.post('/api/calculate-route', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// --- [Scheduler] Image Health Check ---
+const { startImageScheduler } = require('./jobs/image_cron');
+startImageScheduler();
 
 app.listen(PORT, () => {
   console.log(`🚀 TripGen Server running on port ${PORT}`);
