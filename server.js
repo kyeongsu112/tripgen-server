@@ -155,8 +155,8 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
         headers: {
           "Content-Type": "application/json",
           "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
-          // 🚨 photos 필드 제외 확인 (비용 절감)
-          "X-Goog-FieldMask": "places.id,places.rating,places.userRatingCount,places.googleMapsUri,places.location,places.websiteUri,places.types,places.displayName,places.formattedAddress"
+          // ✨ photos 필드 추가 (Fallback용)
+          "X-Goog-FieldMask": "places.id,places.rating,places.userRatingCount,places.googleMapsUri,places.location,places.websiteUri,places.types,places.displayName,places.formattedAddress,places.photos"
         }
       }
     );
@@ -167,16 +167,13 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
     console.log(`📍 API Search Result: ${place.displayName?.text}`);
 
     // [4] Naver Image Search (Primary)
-    // 💡 구글 장소명이 더 정확하므로 구글이 준 이름(place.displayName.text)을 사용하여 검색
     const searchName = place.displayName?.text || placeName;
-
-    // ✨ [Optimization] 검색어 정밀화 (Context-Aware Search)
     const getSearchSuffix = (types = []) => {
-      if (types.some(t => ['restaurant', 'food', 'cafe', 'bar', 'bakery', 'meal_takeaway'].includes(t))) return " 음식"; // 맛집/음식
-      if (types.some(t => ['tourist_attraction', 'point_of_interest', 'park', 'landmark'].includes(t))) return " 전경"; // 풍경/전경
-      if (types.some(t => ['lodging', 'hotel', 'guest_house'].includes(t))) return " 객실"; // 호텔/숙소
-      if (types.some(t => ['shopping_mall', 'store'].includes(t))) return " 매장"; // 쇼핑/매장
-      return " 사진"; // 기본
+      if (types.some(t => ['restaurant', 'food', 'cafe', 'bar', 'bakery', 'meal_takeaway'].includes(t))) return " 음식";
+      if (types.some(t => ['tourist_attraction', 'point_of_interest', 'park', 'landmark'].includes(t))) return " 전경";
+      if (types.some(t => ['lodging', 'hotel', 'guest_house'].includes(t))) return " 객실";
+      if (types.some(t => ['shopping_mall', 'store'].includes(t))) return " 매장";
+      return " 사진";
     };
 
     const suffix = getSearchSuffix(place.types);
@@ -184,25 +181,41 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
 
     let photoUrl = await fetchNaverImage(searchQuery);
 
-    // 만약 네이버 이미지를 못 찾았다면? -> Fallback 이미지 사용 (구글 포토 호출 X)
+    // [5] Fallback: Google Places Photo
+    // 만약 네이버 이미지를 못 찾았다면? -> Google Photo 사용
+    let photoReference = null;
+
+    if (!photoUrl && place.photos && place.photos.length > 0) {
+      console.log(`📸 Naver failed, using Google Photo for: ${searchName}`);
+      photoReference = place.photos[0].name; // "places/PLACE_ID/photos/PHOTO_ID"
+      // 저장할 때는 Proxy URL이 아닌, 원본 Reference나 식별자를 저장하는 것이 좋지만,
+      // 클라이언트 호환성을 위해 Proxy URL로 변환하여 photoUrl에 저장 (혹은 별도 컬럼)
+      // 여기서는 photoUrl에 Proxy 경로를 저장함.
+      // ⚠️ 주의: 로컬/배포 환경에 따라 도메인이 다를 수 있으므로 상대 경로 사용 권장 (/api/...) 
+      // 하지만 DB에 저장하려면 절대 경로가 필요할 수도 있음. 프론트엔드에서 처리 가능한지 확인 필요.
+      // Next.js rewrites 덕분에 프론트가 같은 도메인이면 상대 경로 OK.
+      photoUrl = `/api/proxy/google-photo/${photoReference}`;
+    }
+
+    // 여전히 없으면 Fallback
     if (!photoUrl) {
       photoUrl = getFallbackImage(place.types);
     }
 
     const placeData = {
       place_id: place.id,
-      place_name: searchName, // 정제된 구글 장소명 사용
+      place_name: searchName,
       rating: place.rating,
       ratingCount: place.userRatingCount,
       googleMapsUri: place.googleMapsUri,
       websiteUri: place.websiteUri,
-      photoUrl: photoUrl, // 네이버 이미지
-      photoReference: null,
+      photoUrl: photoUrl,
+      photoReference: photoReference,
       location: place.location,
       types: place.types
     };
 
-    // [5] DB에 캐시 저장
+    // [6] DB에 캐시 저장
     const newKeywords = [placeName, placeData.place_name, place.formattedAddress].filter(Boolean).join('|');
 
     await supabase.from('places_cache').upsert([{
@@ -214,12 +227,12 @@ async function fetchPlaceDetails(placeName, cityContext = "") {
       google_maps_uri: placeData.googleMapsUri,
       website_uri: placeData.websiteUri,
       photo_url: placeData.photoUrl,
-      photo_reference: null,
+      photo_reference: placeData.photoReference,
       location: placeData.location,
       types: placeData.types
     }], { onConflict: 'place_id' }).select();
 
-    addToCache(placeName, placeData); // 메모리 캐시에도 저장
+    addToCache(placeName, placeData);
 
     return placeData;
   } catch (error) {
@@ -511,11 +524,15 @@ app.post('/api/generate-trip', async (req, res) => {
       }
     }
 
-    // ✨ [Optimization] Text-Based Cover Image (Korean Region Name Only)
-    const koreanRegion = await getKoreanRegionName(destination);
-    const coverImageUrl = `${SERVER_BASE_URL}/api/text-cover?text=${encodeURIComponent(koreanRegion)}`;
-    console.log(`🎨 Generated Text Cover: ${coverImageUrl} (from ${destination})`);
+    // ✨ [Optimization] Cover Photo Logic
+    // Remove forced text cover generation. Leave it null/empty.
+    // Frontend will handle it via 'getTripCoverImage' -> '/api/place-image'
+    // This ensures real photos are used instead of "Text Covers".
+    // const koreanRegion = await getKoreanRegionName(destination);
+    // const coverImageUrl = `${SERVER_BASE_URL}/api/text-cover?text=${encodeURIComponent(koreanRegion)}`;
+    // console.log(`🎨 Generated Text Cover: ${coverImageUrl} (from ${destination})`);
 
+    const coverImageUrl = null; // Use NULL to trigger frontend fallback logic
     itineraryJson.cover_image = coverImageUrl;
 
     const { data, error } = await supabase.from('trip_plans').insert([{
@@ -714,7 +731,8 @@ app.get('/api/place-image', async (req, res) => {
 
       const place = googleRes.data.places && googleRes.data.places[0];
       if (place && place.photos && place.photos.length > 0) {
-        const googlePhotoUrl = `${SERVER_BASE_URL}/api/proxy/google-photo/${place.photos[0].name}`;
+        // Use relative path to avoid localhost issues
+        const googlePhotoUrl = `/api/proxy/google-photo/${place.photos[0].name}`;
         return res.redirect(googlePhotoUrl);
       }
     } catch (googleError) {
@@ -731,10 +749,45 @@ app.get('/api/place-image', async (req, res) => {
 });
 
 // --- [API 3.6] Google Photo Proxy (Secure) ---
-// [Fix] Use Regex route to avoid string parsing issues with special characters
+// Proxies the image data from Google Places Media API
 app.get(/\/api\/proxy\/google-photo\/(.*)/, async (req, res) => {
-  const photoName = req.params[0];
-  res.redirect(FALLBACK_IMAGE_URL);
+  const photoName = req.params[0]; // will be "places/PLACE_ID/photos/PHOTO_ID"
+
+  if (!photoName) return res.redirect(FALLBACK_IMAGE_URL);
+
+  const googlePhotoUrl = `https://places.googleapis.com/v1/${photoName}/media?key=${GOOGLE_MAPS_API_KEY}&maxHeightPx=800&maxWidthPx=800&skipHttpRedirect=true`;
+
+  try {
+    // Fetch the actual image URL from Google (skipHttpRedirect=true returns a JSON with 'photoUri')
+    // OR fetch the binary directly if skipHttpRedirect=false. 
+    // Google Places Media API (v1) behavior:
+    // If skipHttpRedirect is NOT set (default), it returns 302.
+    // If set to true, it returns JSON { name, photoUri }.
+
+    // Let's use the 302 redirect directly? 
+    // Issue: If we redirect client to Google URL, the client sees the API Key? 
+    // Wait, the v1 url contains parameters. API Key is in query. Yes, exposing API Key to client is bad.
+    // So we must proxy the binary data.
+
+    const response = await axios({
+      method: 'get',
+      url: `https://places.googleapis.com/v1/${photoName}/media`,
+      params: {
+        key: GOOGLE_MAPS_API_KEY,
+        maxHeightPx: 800,
+        maxWidthPx: 800
+      },
+      responseType: 'stream'
+    });
+
+    res.setHeader('Content-Type', response.headers['content-type']);
+    res.setHeader('Cache-Control', 'public, max-age=86400'); // Cache for 1 day
+    response.data.pipe(res);
+
+  } catch (error) {
+    console.error("Google Photo Proxy Error:", error.message);
+    res.redirect(FALLBACK_IMAGE_URL);
+  }
 });
 
 // --- [API 3] 자동완성 (New API + 도시 필터링) ---
@@ -745,11 +798,10 @@ app.get('/api/places/autocomplete', async (req, res) => {
   if (!query) return res.status(200).json({ predictions: [] });
 
   try {
-    // [Refinement] Limit granularity globally to Country, Level 1 (Do/State), Level 2 (Si/County).
-    // User requested "3rd largest administrative district" (Country -> Do -> Si).
-    // Note: This excludes 'locality' (City) which might affect some US cities, but strictly follows the "3rd level" rule.
-    // If US cities like "Los Angeles" disappear (showing only County), we might need to re-add 'locality'.
-    const primaryTypes = ["administrative_area_level_1", "administrative_area_level_2", "country"];
+    // [Refinement] Limit granularity globally to Country, Level 1 (Do/State), Level 2 (Si/County), and Locality (City).
+    // We MUST include 'locality' because major cities like "Las Vegas", "Paris", "London" are localities.
+    // We exclude 'sublocality' and 'neighborhood' to avoid small districts (Dong/Eup/Myeon).
+    const primaryTypes = ["locality", "administrative_area_level_1", "administrative_area_level_2", "country"];
 
     const response = await axios.post(
       `https://places.googleapis.com/v1/places:autocomplete`,
@@ -1043,10 +1095,12 @@ app.post('/api/admin/update-covers', async (req, res) => {
       // 여기서는 무조건 업데이트하거나, 특정 조건(예: unsplash)일 때만 업데이트하도록 설정 가능
       // 현재는 "기존 이미지 갱신" 요청이므로 모든 항목에 대해 시도합니다.
 
-      // Text-Based Cover Image Update (Korean Region Name Only)
-      const koreanRegion = await getKoreanRegionName(destination);
-      const newImage = `${SERVER_BASE_URL}/api/text-cover?text=${encodeURIComponent(koreanRegion)}`;
-      console.log(`🖼️ Updating Trip ${id} (${destination}) -> ${newImage}`);
+      // Text-Based Cover Image Update -> SWITCHED TO "Null" for Dynamic Fetch
+      // Old: const koreanRegion = await getKoreanRegionName(destination);
+      // Old: const newImage = `${SERVER_BASE_URL}/api/text-cover?text=${encodeURIComponent(koreanRegion)}`;
+
+      const newImage = null; // Let frontend fetch dynamically via getTripCoverImage
+      console.log(`🖼️ Updating Trip ${id} (${destination}) -> NULL (Dynamic Fetch Enabled)`);
 
       // JSON 데이터 업데이트
       itinerary_data.cover_image = newImage;
