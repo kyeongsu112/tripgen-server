@@ -1563,13 +1563,13 @@ app.put('/api/user/profile', async (req, res) => {
   }
 
   try {
-    // 1. 중복 체크 (본인 제외)
+    // 1. 중복 체크 (본인 제외) - maybeSingle 사용으로 에러 방지
     const { data: existing } = await supabase
       .from('user_profiles')
       .select('user_id')
       .eq('nickname', nickname)
       .neq('user_id', user_id)
-      .single();
+      .maybeSingle();
 
     if (existing) {
       return res.status(400).json({ error: "이미 사용 중인 닉네임입니다" });
@@ -1588,26 +1588,27 @@ app.put('/api/user/profile', async (req, res) => {
     if (error) throw error;
 
     // 3. 기존 게시글 닉네임도 업데이트 (익명이 아닌 글만)
-    await supabase
+    const { error: communityError } = await supabase
       .from('community')
       .update({ nickname })
       .eq('user_id', user_id)
       .eq('is_anonymous', false);
 
+    if (communityError) console.error("Community update error:", communityError);
+
     // 4. 기존 댓글 닉네임도 업데이트 (익명이 아닌 댓글만)
-    await supabase
+    const { error: commentsError } = await supabase
       .from('community_comments')
       .update({ nickname })
       .eq('user_id', user_id)
       .eq('is_anonymous', false);
 
+    if (commentsError) console.error("Comments update error:", commentsError);
+
     console.log(`✅ Nickname updated for user ${user_id}: ${nickname}`);
     res.status(200).json({ success: true, data });
   } catch (error) {
-    // 중복 체크 시 single()이 에러 던질 수 있으므로 무시
-    if (error.code === 'PGRST116') {
-      // 중복 없음, 계속 진행 (하지만 이 위치에선 이미 처리됨)
-    }
+    console.error("Profile update error:", error);
     res.status(500).json({ error: error.message });
   }
 });
