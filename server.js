@@ -1553,14 +1553,29 @@ app.get('/api/user/profile', async (req, res) => {
 });
 
 app.put('/api/user/profile', async (req, res) => {
-  const { user_id, nickname } = req.body;
+  const { user_id, nickname: rawNickname } = req.body;
   if (!user_id) return res.status(400).json({ error: "User ID 필요" });
+
+  // 공백 제거 및 검증
+  const nickname = rawNickname?.trim();
   if (!nickname || nickname.length < 2 || nickname.length > 12) {
     return res.status(400).json({ error: "닉네임은 2~12자로 입력해주세요" });
   }
 
   try {
-    // 1. user_profiles 테이블 upsert
+    // 1. 중복 체크 (본인 제외)
+    const { data: existing } = await supabase
+      .from('user_profiles')
+      .select('user_id')
+      .eq('nickname', nickname)
+      .neq('user_id', user_id)
+      .single();
+
+    if (existing) {
+      return res.status(400).json({ error: "이미 사용 중인 닉네임입니다" });
+    }
+
+    // 2. user_profiles 테이블 upsert
     const { data, error } = await supabase
       .from('user_profiles')
       .upsert({
@@ -1572,14 +1587,14 @@ app.put('/api/user/profile', async (req, res) => {
 
     if (error) throw error;
 
-    // 2. 기존 게시글 닉네임도 업데이트 (익명이 아닌 글만)
+    // 3. 기존 게시글 닉네임도 업데이트 (익명이 아닌 글만)
     await supabase
       .from('community')
       .update({ nickname })
       .eq('user_id', user_id)
       .eq('is_anonymous', false);
 
-    // 3. 기존 댓글 닉네임도 업데이트 (익명이 아닌 댓글만)
+    // 4. 기존 댓글 닉네임도 업데이트 (익명이 아닌 댓글만)
     await supabase
       .from('community_comments')
       .update({ nickname })
@@ -1589,6 +1604,10 @@ app.put('/api/user/profile', async (req, res) => {
     console.log(`✅ Nickname updated for user ${user_id}: ${nickname}`);
     res.status(200).json({ success: true, data });
   } catch (error) {
+    // 중복 체크 시 single()이 에러 던질 수 있으므로 무시
+    if (error.code === 'PGRST116') {
+      // 중복 없음, 계속 진행 (하지만 이 위치에선 이미 처리됨)
+    }
     res.status(500).json({ error: error.message });
   }
 });
