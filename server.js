@@ -715,6 +715,11 @@ app.post('/api/generate-trip', async (req, res) => {
       2. **장소:** 구체적 상호명 필수 (예: '맛집' X -> '명동교자' O).
       3. **중복:** 같은 장소 반복 금지.
       4. **데이터:** photoUrl 등 상세 정보 제외.
+      5. **[중요] 장소 유형 일관성:**
+         - "식사" 타입은 반드시 음식점, 카페, 베이커리 등 식음료 전문점만 추천하세요.
+         - 왁싱샵, 미용실, 네일샵, 마사지샵, 스파 등 뷰티/미용 업종은 "관광" 또는 "휴식" 타입으로만 분류하세요. 절대 "식사"로 분류하지 마세요.
+         - 장소명에 "뷰티", "왁싱", "네일", "미용", "스파", "마사지" 등이 포함된 경우 식사 장소로 추천하면 안 됩니다.
+         - activity_description은 반드시 place_name과 일치해야 합니다. (예: 왁싱샵인데 "카페에서 아침 식사" 설명 금지)
 
       [출력 JSON]
       { 
@@ -762,6 +767,24 @@ app.post('/api/generate-trip', async (req, res) => {
           }
         }
       });
+
+      // 🔧 [Fix] 뷰티/미용 업종이 "식사"로 분류된 경우 타입 수정
+      const beautyKeywords = ['왁싱', '뷰티', '네일', '미용', '스파', '마사지', '피부', '에스테틱', '헤어'];
+      uniqueActivities.forEach(act => {
+        if (act.type === '식사') {
+          const placeLower = act.place_name.toLowerCase();
+          const descLower = (act.activity_description || '').toLowerCase();
+          if (beautyKeywords.some(keyword => placeLower.includes(keyword) || descLower.includes(keyword))) {
+            console.log(`⚠️ Correcting misclassified beauty place: ${act.place_name} (식사 -> 관광)`);
+            act.type = '관광';
+            // 설명도 장소와 맞지 않으면 수정
+            if (descLower.includes('카페') || descLower.includes('식사') || descLower.includes('베이커리') || descLower.includes('빵')) {
+              act.activity_description = `${act.place_name}에서 휴식 및 뷰티 체험을 즐깁니다.`;
+            }
+          }
+        }
+      });
+
       dayPlan.activities = uniqueActivities;
 
       // ⚡ 병렬 처리로 장소 상세 정보 조회
@@ -1098,16 +1121,26 @@ app.delete('/api/auth/delete', async (req, res) => {
     if (email) {
       await supabase.from('deleted_users').insert([{ email: email }]);
     }
+
+    // 여행 일정은 삭제
     await supabase.from('trip_plans').delete().eq('user_id', user_id);
     await supabase.from('user_limits').delete().eq('user_id', user_id);
-    await supabase.from('suggestions').delete().eq('user_id', user_id);
-    await supabase.from('community').delete().eq('user_id', user_id);
+
+    // 건의사항/커뮤니티 글은 삭제하지 않고 "탈퇴한 사용자"로 표시
+    await supabase.from('suggestions')
+      .update({ user_id: null, email: '탈퇴한 사용자' })
+      .eq('user_id', user_id);
+
+    await supabase.from('community')
+      .update({ user_id: null, nickname: '탈퇴한 사용자', email: '탈퇴한 사용자' })
+      .eq('user_id', user_id);
 
     const { error: deleteError } = await supabaseAdmin.auth.admin.deleteUser(user_id);
     if (deleteError) throw deleteError;
 
     res.status(200).json({ success: true, message: "회원 탈퇴 완료" });
   } catch (error) {
+    console.error("Delete account error:", error);
     res.status(500).json({ error: "탈퇴 처리 중 오류" });
   }
 });
@@ -1137,6 +1170,42 @@ app.post('/api/board', async (req, res) => {
     res.status(200).json({ success: true, data });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// --- [API] 탈퇴 이메일 재가입 가능 여부 확인 ---
+app.post('/api/auth/check-deleted', async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "이메일 필요" });
+
+  try {
+    const { data: deletedUser } = await supabase
+      .from('deleted_users')
+      .select('*')
+      .eq('email', email)
+      .order('deleted_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (deletedUser) {
+      const deletedAt = new Date(deletedUser.deleted_at);
+      const now = new Date();
+      const daysSinceDelete = Math.floor((now - deletedAt) / (1000 * 60 * 60 * 24));
+      const remainingDays = 30 - daysSinceDelete;
+
+      if (remainingDays > 0) {
+        return res.status(200).json({
+          blocked: true,
+          remainingDays: remainingDays,
+          message: `탈퇴 후 30일이 지나지 않았습니다. ${remainingDays}일 후에 재가입이 가능합니다.`
+        });
+      }
+    }
+
+    res.status(200).json({ blocked: false });
+  } catch (error) {
+    // 데이터가 없는 경우 (차단 아님)
+    res.status(200).json({ blocked: false });
   }
 });
 
@@ -1211,12 +1280,50 @@ app.delete('/api/trip/:id', async (req, res) => {
 // --- [API 9] 커뮤니티 게시판 ---
 app.get('/api/community', async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('community')
-      .select('*')
-      .order('created_at', { ascending: false });
+    const { sort, period, user_id } = req.query;
+
+    // 기간 필터 계산
+    let dateFilter = null;
+    if (period === 'day') {
+      dateFilter = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    } else if (period === 'week') {
+      dateFilter = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    } else if (period === 'month') {
+      dateFilter = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+    }
+
+    // 게시글 조회
+    let query = supabase.from('community').select('*');
+
+    if (dateFilter) {
+      query = query.gte('created_at', dateFilter);
+    }
+
+    query = query.order('created_at', { ascending: false });
+
+    const { data: posts, error } = await query;
     if (error) throw error;
-    res.status(200).json({ success: true, data });
+
+    // 각 게시글에 좋아요 수 추가
+    const { data: allLikes } = await supabase
+      .from('community_likes')
+      .select('post_id, user_id');
+
+    const postsWithLikes = posts.map(post => {
+      const postLikes = allLikes?.filter(like => like.post_id == post.id) || [];
+      return {
+        ...post,
+        likes_count: postLikes.length,
+        user_liked: user_id ? postLikes.some(like => like.user_id === user_id) : false
+      };
+    });
+
+    // 인기순 정렬
+    if (sort === 'popular') {
+      postsWithLikes.sort((a, b) => b.likes_count - a.likes_count);
+    }
+
+    res.status(200).json({ success: true, data: postsWithLikes });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -1264,6 +1371,223 @@ app.delete('/api/community/:id', async (req, res) => {
     const { error } = await supabase.from('community').delete().eq('id', id);
     if (error) throw error;
     res.status(200).json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- [API 9.1] 좋아요 토글 ---
+app.post('/api/community/:id/like', async (req, res) => {
+  const { id } = req.params;
+  const { user_id } = req.body;
+
+  if (!user_id) return res.status(401).json({ error: "로그인이 필요합니다" });
+
+  try {
+    // 기존 좋아요 확인
+    const { data: existing } = await supabase
+      .from('community_likes')
+      .select('*')
+      .eq('post_id', id)
+      .eq('user_id', user_id)
+      .single();
+
+    if (existing) {
+      // 좋아요 취소
+      await supabase.from('community_likes').delete().eq('id', existing.id);
+      res.status(200).json({ success: true, liked: false });
+    } else {
+      // 좋아요 추가
+      await supabase.from('community_likes').insert([{ post_id: id, user_id }]);
+      res.status(200).json({ success: true, liked: true });
+    }
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- [API 9.2] 게시글 좋아요 수 및 상태 조회 ---
+app.get('/api/community/:id/likes', async (req, res) => {
+  const { id } = req.params;
+  const { user_id } = req.query;
+
+  try {
+    const { data: likes, count } = await supabase
+      .from('community_likes')
+      .select('*', { count: 'exact' })
+      .eq('post_id', id);
+
+    let userLiked = false;
+    if (user_id) {
+      userLiked = likes?.some(like => like.user_id === user_id) || false;
+    }
+
+    res.status(200).json({ success: true, count: count || 0, userLiked });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- [API 9.3] 댓글 목록 조회 ---
+app.get('/api/community/:id/comments', async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const { data, error } = await supabase
+      .from('community_comments')
+      .select('*')
+      .eq('post_id', id)
+      .order('created_at', { ascending: true });
+
+    if (error) throw error;
+    res.status(200).json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- [API 9.4] 댓글 작성 ---
+app.post('/api/community/:id/comments', async (req, res) => {
+  const { id } = req.params;
+  const { user_id, nickname, content, is_anonymous } = req.body;
+
+  if (!content) return res.status(400).json({ error: "내용이 필요합니다" });
+
+  try {
+    const { data, error } = await supabase.from('community_comments').insert([{
+      post_id: id,
+      user_id: user_id || null,
+      nickname: is_anonymous ? '익명' : (nickname || '익명'),
+      content,
+      is_anonymous: is_anonymous || false
+    }]).select();
+
+    if (error) throw error;
+    res.status(200).json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- [API 9.5] 댓글 삭제 ---
+app.delete('/api/community/comments/:id', async (req, res) => {
+  const { id } = req.params;
+  const { user_id, email } = req.body;
+
+  try {
+    const { data: comment } = await supabase
+      .from('community_comments')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (!comment) return res.status(404).json({ error: "댓글을 찾을 수 없습니다" });
+
+    const isOwner = user_id && comment.user_id === user_id;
+    const isAdmin = email === ADMIN_EMAIL;
+
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({ error: "삭제 권한이 없습니다" });
+    }
+
+    const { error } = await supabase.from('community_comments').delete().eq('id', id);
+    if (error) throw error;
+    res.status(200).json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- [API 9.6] 여행 일정 프리뷰 (카드용) ---
+app.get('/api/trip-preview/:id', async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const { data, error } = await supabase
+      .from('trip_plans')
+      .select('id, destination, duration, itinerary_data')
+      .eq('id', id)
+      .single();
+
+    if (error || !data) {
+      return res.status(404).json({ success: false, error: "일정을 찾을 수 없습니다" });
+    }
+
+    // 첫 번째 활동의 이미지를 커버로 사용
+    let coverImage = null;
+    if (data.itinerary_data?.itinerary?.[0]?.activities?.[0]?.photoUrl) {
+      coverImage = data.itinerary_data.itinerary[0].activities[0].photoUrl;
+    }
+
+    res.status(200).json({
+      success: true,
+      data: {
+        id: data.id,
+        title: data.itinerary_data?.trip_title || data.destination,
+        destination: data.destination,
+        duration: data.duration,
+        coverImage: coverImage || FALLBACK_IMAGE_URL
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- [API 9.7] 닉네임 조회/저장 ---
+app.get('/api/user/profile', async (req, res) => {
+  const { user_id } = req.query;
+  if (!user_id) return res.status(400).json({ error: "User ID 필요" });
+
+  try {
+    const { data } = await supabase
+      .from('user_profiles')
+      .select('*')
+      .eq('user_id', user_id)
+      .single();
+
+    res.status(200).json({ success: true, data: data || null });
+  } catch (error) {
+    res.status(200).json({ success: true, data: null });
+  }
+});
+
+app.put('/api/user/profile', async (req, res) => {
+  const { user_id, nickname } = req.body;
+  if (!user_id) return res.status(400).json({ error: "User ID 필요" });
+  if (!nickname || nickname.length < 2 || nickname.length > 12) {
+    return res.status(400).json({ error: "닉네임은 2~12자로 입력해주세요" });
+  }
+
+  try {
+    // 1. user_profiles 테이블 upsert
+    const { data, error } = await supabase
+      .from('user_profiles')
+      .upsert({
+        user_id,
+        nickname,
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'user_id' })
+      .select();
+
+    if (error) throw error;
+
+    // 2. 기존 게시글 닉네임도 업데이트 (익명이 아닌 글만)
+    await supabase
+      .from('community')
+      .update({ nickname })
+      .eq('user_id', user_id)
+      .eq('is_anonymous', false);
+
+    // 3. 기존 댓글 닉네임도 업데이트 (익명이 아닌 댓글만)
+    await supabase
+      .from('community_comments')
+      .update({ nickname })
+      .eq('user_id', user_id)
+      .eq('is_anonymous', false);
+
+    console.log(`✅ Nickname updated for user ${user_id}: ${nickname}`);
+    res.status(200).json({ success: true, data });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
