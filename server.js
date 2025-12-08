@@ -1309,21 +1309,43 @@ app.get('/api/community', async (req, res) => {
       .from('community_likes')
       .select('post_id, user_id');
 
-    const postsWithLikes = posts.map(post => {
+    // 게시글별 사용자 정보 동적 조회 (닉네임, 프로필 사진)
+    const postsWithUserInfo = await Promise.all(posts.map(async (post) => {
       const postLikes = allLikes?.filter(like => like.post_id == post.id) || [];
+
+      let displayNickname = post.nickname;
+      let avatarUrl = null;
+
+      // 익명이 아니고 user_id가 있는 경우 최신 사용자 정보 조회
+      if (!post.is_anonymous && post.user_id) {
+        try {
+          const { data: userData } = await supabaseAdmin.auth.admin.getUserById(post.user_id);
+          if (userData?.user?.user_metadata) {
+            const meta = userData.user.user_metadata;
+            displayNickname = meta.nickname || post.nickname;
+            avatarUrl = meta.custom_avatar_url || meta.avatar_url || null;
+          }
+        } catch (userErr) {
+          // 사용자 정보 조회 실패 시 기존 닉네임 사용
+          console.error(`Failed to fetch user info for ${post.user_id}:`, userErr.message);
+        }
+      }
+
       return {
         ...post,
+        nickname: displayNickname,
+        avatar_url: avatarUrl,
         likes_count: postLikes.length,
         user_liked: user_id ? postLikes.some(like => like.user_id === user_id) : false
       };
-    });
+    }));
 
     // 인기순 정렬
     if (sort === 'popular') {
-      postsWithLikes.sort((a, b) => b.likes_count - a.likes_count);
+      postsWithUserInfo.sort((a, b) => b.likes_count - a.likes_count);
     }
 
-    res.status(200).json({ success: true, data: postsWithLikes });
+    res.status(200).json({ success: true, data: postsWithUserInfo });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -1433,14 +1455,41 @@ app.get('/api/community/:id/comments', async (req, res) => {
   const { id } = req.params;
 
   try {
-    const { data, error } = await supabase
+    const { data: comments, error } = await supabase
       .from('community_comments')
       .select('*')
       .eq('post_id', id)
       .order('created_at', { ascending: true });
 
     if (error) throw error;
-    res.status(200).json({ success: true, data });
+
+    // 댓글별 사용자 정보 동적 조회 (닉네임, 프로필 사진)
+    const commentsWithUserInfo = await Promise.all(comments.map(async (comment) => {
+      let displayNickname = comment.nickname;
+      let avatarUrl = null;
+
+      // 익명이 아니고 user_id가 있는 경우 최신 사용자 정보 조회
+      if (!comment.is_anonymous && comment.user_id) {
+        try {
+          const { data: userData } = await supabaseAdmin.auth.admin.getUserById(comment.user_id);
+          if (userData?.user?.user_metadata) {
+            const meta = userData.user.user_metadata;
+            displayNickname = meta.nickname || comment.nickname;
+            avatarUrl = meta.custom_avatar_url || meta.avatar_url || null;
+          }
+        } catch (userErr) {
+          console.error(`Failed to fetch user info for ${comment.user_id}:`, userErr.message);
+        }
+      }
+
+      return {
+        ...comment,
+        nickname: displayNickname,
+        avatar_url: avatarUrl
+      };
+    }));
+
+    res.status(200).json({ success: true, data: commentsWithUserInfo });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
